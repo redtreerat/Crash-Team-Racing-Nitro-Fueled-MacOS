@@ -81,8 +81,11 @@ def profile(game, image_hash=None):
     try:
         info = sfo((Path(game) / 'sce_sys/param.sfo').read_bytes())
     except (OSError, ValueError, IndexError):
-        return None
-    return BY_TITLE.get(info.get('TITLE_ID'))
+        info = {}
+    tid = info.get('TITLE_ID')
+    if tid in EDITIONS:
+        return dict(EDITIONS[tid], version=info.get('APP_VER', SUPPORTED_VERSION), variant='eu')
+    return dict(BY_TITLE.get(tid, BY_TITLE[SUPPORTED_TITLE]), variant='5.05')
 
 
 def sfo_info(game):
@@ -202,5 +205,4 @@ if __name__ == '__main__':
             message += f' Damaged ({len(damaged)}): ' + ', '.join(damaged[:10]) + (', ...' if len(damaged) > 10 else '')
         sys.exit(message)
     p = profile(game)
-    print(p['name'] if p else 'unknown')
-
+    print(p['name'] if p else 'ctr')

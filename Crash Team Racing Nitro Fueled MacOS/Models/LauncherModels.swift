@@ -297,7 +297,7 @@ nonisolated struct GameFolderInfo: Sendable, Equatable {
             if isSplitPkgLayout {
                 return "Complete v01.21 in Image0/Sc0 PKG layout (\(formattedSize)) — ready to flatten."
             }
-            return "Ready to play: \(regionBadge) v\(version) (\(formattedSize))."
+            return "Ready to play: \(regionBadge) v\(version.isEmpty ? "01.21" : version) (\(formattedSize))."
         }
     }
 }

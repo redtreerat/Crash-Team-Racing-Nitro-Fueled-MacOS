@@ -168,7 +168,7 @@ struct PlaySectionView: View {
                             if !store.gameDirPath.isEmpty {
                                 let isValid = store.gameInfo.kind == .complete && !store.gameInfo.isSplitPkgLayout && store.gameCheckPassed
                                 Label(
-                                    isValid ? "Ready" : (store.gameInfo.kind == .base || store.gameInfo.kind == .update ? "Merge Required" : "Invalid Folder"),
+                                    isValid ? (store.isPreExtractedInstall ? "Pre-Extracted Ready" : "Ready") : (store.gameInfo.kind == .base || store.gameInfo.kind == .update ? "Merge Required" : "Invalid Folder"),
                                     systemImage: isValid ? "checkmark.circle.fill" : "xmark.octagon.fill"
                                 )
                                 .font(.caption.weight(.semibold))
@@ -179,7 +179,7 @@ struct PlaySectionView: View {
                             }
                         }
 
-                        Text(store.gameDirPath.isEmpty ? "Choose your decrypted CUSA13795 or CUSA14876 1.21 dump." : store.gameDirPath)
+                        Text(store.gameDirPath.isEmpty ? "Choose your decrypted CUSA13795 or CUSA14876 1.21 dump, or a pre-extracted game folder from another device." : store.gameDirPath)
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
@@ -194,11 +194,56 @@ struct PlaySectionView: View {
                             .foregroundStyle(isValid ? .green : .red)
                             .textSelection(.enabled)
                         }
+
+                        Toggle(
+                            "Pre-extracted installation from another device (relax strict param.sfo / image hash check)",
+                            isOn: Binding(
+                                get: { store.isPreExtractedInstall },
+                                set: { newValue in
+                                    store.isPreExtractedInstall = newValue
+                                    store.saveLauncherIni()
+                                    Task { await store.inspectGameFolders() }
+                                }
+                            )
+                        )
+                        .font(.caption)
+                        .padding(.top, 2)
                     }
                     Spacer()
-                    Button("Choose Folder…") {
-                        store.selectGameFolder(slot: .merged)
+                    Menu {
+                        Button {
+                            store.isPreExtractedInstall = false
+                            store.saveLauncherIni()
+                            store.selectGameFolder(slot: .merged)
+                        } label: {
+                            Label("Select Merged v01.21 Dump Folder…", systemImage: "opticaldisc.fill")
+                        }
+
+                        Button {
+                            store.selectPreExtractedGameFolder()
+                        } label: {
+                            Label("Select Pre-Extracted Folder (From Another Device)…", systemImage: "externaldrive.fill.badge.checkmark")
+                        }
+
+                        Divider()
+
+                        Button {
+                            showMergeDrawer = true
+                            store.selectGameFolder(slot: .base)
+                        } label: {
+                            Label("Select Base Game + Update 01.21 to Merge…", systemImage: "square.stack.3d.up.fill")
+                        }
+                    } label: {
+                        Label("Choose Folder…", systemImage: "folder.badge.plus")
+                    } primaryAction: {
+                        if store.isPreExtractedInstall {
+                            store.selectPreExtractedGameFolder()
+                        } else {
+                            store.selectGameFolder(slot: .merged)
+                        }
                     }
+                    .frame(width: 155)
+
                     if !store.gameDirPath.isEmpty {
                         Button {
                             store.revealInFinder(URL(fileURLWithPath: store.gameDirPath))

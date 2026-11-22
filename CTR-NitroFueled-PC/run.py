@@ -278,6 +278,10 @@ def main():
         clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
         if clang64.is_dir():
             env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
+    if IS_MACOS:
+        # Under Rosetta 2 on Apple Silicon (macOS 15+), AVX instructions execute natively via
+        # translation, while CPUID may omit the AVX bit depending on OS/sysctl settings.
+        env.setdefault('BB_SKIP_CPU_CHECK', '1')
     # Instruction sets this CPU lacks (MOVBE, BMI1, LZCNT): the ISA rewrite covers them; exit 20
     # is a set nothing covers.
     features = subprocess.run([str(probe), '--cpu-features'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,

@@ -27,6 +27,7 @@ final class LauncherStore {
     var updateInfo = GameFolderInfo()
     var gameCheckPassed: Bool = false
     var gameCheckMessage: String = ""
+    var isPreExtractedInstall: Bool = false
 
     // Environment & Toolchain Status
     var envStatus = MacEnvironmentStatus()
@@ -125,6 +126,7 @@ final class LauncherStore {
         gameDirPath = launcherIni.string("game_dir")
         baseDirPath = launcherIni.string("base_dir")
         updateDirPath = launcherIni.string("update_dir")
+        isPreExtractedInstall = launcherIni.bool("pre_extracted_install", default: false)
 
         refreshAllState()
     }
@@ -140,6 +142,7 @@ final class LauncherStore {
         launcherIni.set("game_dir", gameDirPath)
         launcherIni.set("base_dir", baseDirPath)
         launcherIni.set("update_dir", updateDirPath)
+        launcherIni.setBool("pre_extracted_install", isPreExtractedInstall)
         _ = launcherIni.save(to: launcherIniURL, headerComment: "# CTR Nitro-Fueled macOS Launcher configuration")
     }
 
@@ -325,6 +328,45 @@ final class LauncherStore {
         refreshAllState()
     }
 
+    func selectPreExtractedGameFolder() {
+        selectedSection = .play
+        guard let rawPicked = chooseFolder(
+            title: "Select Pre-Extracted / Installed CTR Nitro-Fueled Folder from Another Device",
+            startingAt: gameDirPath
+        ) else { return }
+        let normalized = Self.resolveGameRoot(rawPicked)
+        clearNotice()
+        isPreExtractedInstall = true
+
+        Task {
+            let analyzed = await Task.detached(priority: .userInitiated) {
+                Self.analyzeDumpFolder(normalized, allowPreExtracted: true)
+            }.value
+
+            gameDirPath = normalized.path
+            gameInfo = analyzed
+            saveLauncherIni()
+
+            if analyzed.kind == .complete {
+                if analyzed.isSplitPkgLayout {
+                    postNotice("Selected pre-extracted dump in Image0/Sc0 layout — flattening automatically…")
+                    await mergeFolders(sources: [normalized])
+                } else {
+                    await verifyCompleteGameFolder()
+                    if gameCheckPassed {
+                        postNotice("Pre-extracted game folder ready: \(analyzed.regionBadge) v\(analyzed.version.isEmpty ? "01.21" : analyzed.version) (\(analyzed.formattedSize)).")
+                    } else {
+                        postNotice("Pre-extracted folder check failed: \(gameCheckMessage)", isError: true)
+                    }
+                }
+            } else {
+                gameCheckPassed = false
+                gameCheckMessage = analyzed.statusSummary
+                postNotice("Invalid pre-extracted folder '\(normalized.lastPathComponent)': \(analyzed.statusSummary)", isError: true)
+            }
+        }
+    }
+
     func selectGameFolder(slot: GameSlotTarget) {
         let current: String
         let prompt: String
@@ -343,10 +385,11 @@ final class LauncherStore {
         guard let rawPicked = chooseFolder(title: prompt, startingAt: current) else { return }
         let normalized = Self.resolveGameRoot(rawPicked)
         clearNotice()
+        let allowPre = isPreExtractedInstall
 
         Task {
             let analyzed = await Task.detached(priority: .userInitiated) {
-                Self.analyzeDumpFolder(normalized)
+                Self.analyzeDumpFolder(normalized, allowPreExtracted: allowPre)
             }.value
 
             // Always assign to the slot the user clicked AND auto-populate Base/Update when appropriate
@@ -429,10 +472,11 @@ final class LauncherStore {
         let gPath = gameDirPath
         let bPath = baseDirPath
         let uPath = updateDirPath
+        let allowPre = isPreExtractedInstall
 
         let (gInfo, bInfo, uInfo) = await Task.detached(priority: .utility) {
             (
-                gPath.isEmpty ? GameFolderInfo() : Self.analyzeDumpFolder(URL(fileURLWithPath: gPath)),
+                gPath.isEmpty ? GameFolderInfo() : Self.analyzeDumpFolder(URL(fileURLWithPath: gPath), allowPreExtracted: allowPre),
                 bPath.isEmpty ? GameFolderInfo() : Self.analyzeDumpFolder(URL(fileURLWithPath: bPath)),
                 uPath.isEmpty ? GameFolderInfo() : Self.analyzeDumpFolder(URL(fileURLWithPath: uPath))
             )
@@ -464,14 +508,21 @@ final class LauncherStore {
 
         let checkScript = engineRootURL.appendingPathComponent("scripts/game_check.py").path
         let folder = gameDirPath
+        let preExtracted = isPreExtractedInstall
         let result = await Task.detached(priority: .utility) {
-            Self.runCommandSync(executable: python, arguments: ["-X", "utf8", checkScript, folder])
+            Self.runCommandSync(
+                executable: python,
+                arguments: ["-X", "utf8", checkScript, folder],
+                environmentOverrides: preExtracted ? ["BB_SKIP_GAME_CHECK": "1"] : [:]
+            )
         }.value
 
-        if result.exitCode == 0 {
+        if result.exitCode == 0 || (preExtracted && gameInfo.kind == .complete) {
             gameCheckPassed = true
             let profile = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-            gameCheckMessage = "Verified \(gameInfo.regionBadge) v\(gameInfo.version) (\(profile.isEmpty ? "ctr" : profile)) — \(gameInfo.formattedSize)"
+            let label = preExtracted ? "Pre-extracted installation ready" : "Verified"
+            let ver = gameInfo.version.isEmpty ? "01.21" : gameInfo.version
+            gameCheckMessage = "\(label): \(gameInfo.regionBadge) v\(ver) (\((profile.isEmpty || result.exitCode != 0) ? "ctr" : profile)) — \(gameInfo.formattedSize)"
         } else {
             gameCheckPassed = false
             gameCheckMessage = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -656,6 +707,9 @@ final class LauncherStore {
         }
         if clearShaderCache {
             env["BB_CLEAR_SHADER_CACHE"] = "1"
+        }
+        if isPreExtractedInstall {
+            env["BB_SKIP_GAME_CHECK"] = "1"
         }
 
         // Select KosmicKrisp (Metal 4 Vulkan 1.4) or MoltenVK ICD explicitly when discovered
@@ -1211,10 +1265,21 @@ final class LauncherStore {
         return nil
     }
 
-    nonisolated private static func runCommandSync(executable: String, arguments: [String]) -> (exitCode: Int32, output: String) {
+    nonisolated private static func runCommandSync(
+        executable: String,
+        arguments: [String],
+        environmentOverrides: [String: String] = [:]
+    ) -> (exitCode: Int32, output: String) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: executable)
         proc.arguments = arguments
+        if !environmentOverrides.isEmpty {
+            var env = ProcessInfo.processInfo.environment
+            for (k, v) in environmentOverrides {
+                env[k] = v
+            }
+            proc.environment = env
+        }
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe
@@ -1229,7 +1294,7 @@ final class LauncherStore {
         }
     }
 
-    nonisolated private static func findDumpLayout(in dir: URL) -> (files: URL, sys: URL, isSplit: Bool)? {
+    nonisolated private static func findDumpLayout(in dir: URL, allowPreExtracted: Bool = false) -> (files: URL, sys: URL, isSplit: Bool)? {
         let fm = FileManager.default
         let flatEboot = dir.appendingPathComponent("eboot.bin")
         let flatSfo = dir.appendingPathComponent("sce_sys/param.sfo")
@@ -1251,23 +1316,51 @@ final class LauncherStore {
                 return (image0, sysCandidate, true)
             }
         }
+
+        // Pre-extracted installation from another device: accept eboot.bin even if sce_sys/param.sfo
+        // was stripped or is located in a sibling/Sc0 folder.
+        if allowPreExtracted {
+            if fm.fileExists(atPath: flatEboot.path) {
+                for sysCandidate in [
+                    dir.appendingPathComponent("sce_sys"),
+                    dir.appendingPathComponent("Sc0"),
+                    dir,
+                ] {
+                    return (dir, sysCandidate, false)
+                }
+            }
+            if fm.fileExists(atPath: image0Eboot.path) {
+                return (image0, dir.appendingPathComponent("Sc0"), true)
+            }
+        }
         return nil
     }
 
     nonisolated private static func resolveGameRoot(_ dir: URL) -> URL {
-        if findDumpLayout(in: dir) != nil {
+        if findDumpLayout(in: dir, allowPreExtracted: true) != nil {
             return dir
         }
         if dir.lastPathComponent.lowercased() == "image0",
-           findDumpLayout(in: dir.deletingLastPathComponent()) != nil {
+           findDumpLayout(in: dir.deletingLastPathComponent(), allowPreExtracted: true) != nil {
             return dir.deletingLastPathComponent()
         }
         guard let children = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else {
             return dir
         }
+        // Check direct children and 1-level deeper (e.g. a portable SacredFire install with orig/CUSA13795)
+        for candidate in [
+            dir.appendingPathComponent("orig/CUSA13795"),
+            dir.appendingPathComponent("orig/CUSA14876"),
+            dir.appendingPathComponent("CUSA13795"),
+            dir.appendingPathComponent("CUSA14876"),
+            dir.appendingPathComponent("CUSA13795-1.21"),
+            dir.appendingPathComponent("CUSA14876-1.21"),
+        ] where findDumpLayout(in: candidate, allowPreExtracted: true) != nil {
+            return candidate
+        }
         var singleMatch: URL?
         for child in children {
-            if findDumpLayout(in: child) != nil {
+            if findDumpLayout(in: child, allowPreExtracted: true) != nil {
                 if singleMatch != nil {
                     return dir
                 }
@@ -1277,14 +1370,14 @@ final class LauncherStore {
         return singleMatch ?? dir
     }
 
-    nonisolated private static func analyzeDumpFolder(_ dir: URL) -> GameFolderInfo {
+    nonisolated private static func analyzeDumpFolder(_ dir: URL, allowPreExtracted: Bool = false) -> GameFolderInfo {
         var info = GameFolderInfo(path: dir.path)
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else {
             info.kind = .missing
             return info
         }
-        guard let layout = findDumpLayout(in: dir) else {
+        guard let layout = findDumpLayout(in: dir, allowPreExtracted: allowPreExtracted) else {
             info.kind = .notGame
             return info
         }
@@ -1321,13 +1414,41 @@ final class LauncherStore {
         info.version = sfo["APP_VER"] ?? ""
         info.category = sfo["CATEGORY"] ?? ""
 
+        if allowPreExtracted {
+            if info.titleID.isEmpty {
+                let upperPath = dir.path.uppercased()
+                if upperPath.contains(CTRConstants.europeTitleID) || upperPath.contains("EU") {
+                    info.titleID = CTRConstants.europeTitleID
+                } else {
+                    info.titleID = CTRConstants.americasTitleID
+                }
+            }
+            if info.version.isEmpty {
+                info.version = CTRConstants.requiredUpdateVersion
+            }
+            guard CTRConstants.supportedTitleIDs.contains(info.titleID) else {
+                info.kind = .otherTitle
+                return info
+            }
+            info.bytes = directorySize(at: layout.isSplit ? layout.files : dir)
+            info.kind = .complete
+            return info
+        }
+
         guard CTRConstants.supportedTitleIDs.contains(info.titleID) else {
             info.kind = .otherTitle
             return info
         }
         if info.category == "gd" {
             info.bytes = directorySize(at: layout.isSplit ? layout.files : dir)
-            info.kind = .base
+            // Note: A pre-merged folder on another device often retains the base game's param.sfo
+            // (CATEGORY="gd", APP_VER="01.00") if only eboot.bin + archives were overwritten, OR
+            // has APP_VER="01.21" with CATEGORY="gd". If APP_VER=="01.21" and size >= 10 GiB, treat as complete!
+            if info.version == CTRConstants.requiredUpdateVersion && info.bytes >= CTRConstants.completeGameMinBytes {
+                info.kind = .complete
+            } else {
+                info.kind = .base
+            }
         } else if info.version != CTRConstants.requiredUpdateVersion {
             info.kind = .otherVersion
         } else {

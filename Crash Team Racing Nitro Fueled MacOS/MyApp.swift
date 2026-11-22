@@ -26,6 +26,18 @@ struct MyApp: App {
 
                 Divider()
 
+                Button("Select Pre-Extracted / Installed Game Folder…") {
+                    store.selectPreExtractedGameFolder()
+                }
+                .keyboardShortcut("o", modifiers: [.command])
+
+                Button("Select Base Game + Update 01.21 Folders…") {
+                    store.selectedSection = .play
+                    store.selectGameFolder(slot: .base)
+                }
+
+                Divider()
+
                 Button("Clear Compiled Shader Cache") {
                     store.clearShaderCacheNow()
                 }
