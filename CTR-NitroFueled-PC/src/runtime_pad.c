@@ -312,7 +312,17 @@ static int gamepad_active(SDL_Gamepad *g) {
  * is taken as soon as it connects); the controller used last takes over (below); called under lock. */
 static SDL_Gamepad *current_gamepad(void) {
     static int on_preferred; static uint64_t last_scan;
+#ifdef __APPLE__
+    /* On macOS, SDL_INIT_GAMEPAD must only be initialized/quit on Thread 0 (WindowSDL).
+     * Calling SDL_InitSubSystem/SDL_QuitSubSystem from the guest thread crashes inside
+     * DARWIN_JoystickQuit -> IOHIDManagerUnscheduleFromRunLoop. */
+    if (!sdl_ready) {
+        if (!SDL_WasInit(SDL_INIT_GAMEPAD)) return NULL;
+        sdl_ready = 1;
+    }
+#else
     if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
+#endif
     if (sdl_ready<0) return NULL;
     if (gamepad && !SDL_GamepadConnected(gamepad)) { SDL_CloseGamepad(gamepad); gamepad=NULL; }
     const uint64_t now=now_us();
@@ -343,11 +353,17 @@ static SDL_Gamepad *current_gamepad(void) {
         for (int i=0; want && ids && i<count && pick<0; ++i) if (is_preferred(ids[i],want) && !claimed_by_other_port(ids[i],0)) pick=i;
         if (requested || (((want ? pick<0 : count==0) || port_missing) && rescan_due)) { /* the plain scan found nothing usable */
             last_reinit=now;
+#ifdef __APPLE__
+            /* macOS delivers HID/GCController hotplug events natively on Thread 0;
+             * never tear down SDL_INIT_GAMEPAD from a background guest thread. */
+            if (!ids) ids=SDL_GetGamepads(&count);
+#else
             SDL_free(ids); ids=NULL;
             if (gamepad) { SDL_CloseGamepad(gamepad); gamepad=NULL; }
             SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
             if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) { sdl_ready=-1; return NULL; }
             ids=SDL_GetGamepads(&count);
+#endif
             if (requested) printf("Runtime: controllers re-enumerated on request: %d found\n",count);
             else if (reinits++<3) printf("Runtime: %s; devices re-enumerated: %d found\n",want && pick<0 ? "chosen gamepad not seen" : "no gamepad or a port's controller missing",count);
             for (int i=0; want && ids && i<count && pick<0; ++i) if (is_preferred(ids[i],want)) pick=i;
