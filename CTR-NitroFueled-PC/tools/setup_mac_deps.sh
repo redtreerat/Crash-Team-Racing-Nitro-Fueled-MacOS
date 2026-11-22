@@ -2,6 +2,7 @@
 # Bootstraps all macOS x86_64 (Rosetta 2) dependencies and header libraries required to compile
 # and run CTR-NitroFueled-PC (sacredfire + libbbgpu.dylib) with Mesa KosmicKrisp / MoltenVK.
 set -euo pipefail
+export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 cd -- "$(dirname -- "$0")/.."
 
 echo "=== CTR Nitro-Fueled macOS x86_64 Dependency Bootstrapper ==="
@@ -23,7 +24,6 @@ ARM_BREW="/opt/homebrew/bin/brew"
 if [[ -x "$X86_BREW" ]]; then
     echo "[OK] Found x86_64 Homebrew at $X86_BREW"
     BREW_CMD=(/usr/bin/arch -x86_64 "$X86_BREW")
-    BREW_PREFIX="/usr/local"
 elif [[ -x "$ARM_BREW" ]]; then
     echo "[WARN] x86_64 Homebrew (/usr/local/bin/brew) not found."
     echo "       For linking x86_64 libraries (SDL3, FFmpeg, fmt, zydis, xxhash, boost, vulkan-loader),"
@@ -31,17 +31,17 @@ elif [[ -x "$ARM_BREW" ]]; then
     echo "       To install x86_64 Homebrew in Terminal, run:"
     echo '         arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
     BREW_CMD=("$ARM_BREW")
-    BREW_PREFIX="/opt/homebrew"
 else
     echo "[WARN] Homebrew not found in /usr/local or /opt/homebrew."
     echo "       To install x86_64 Homebrew in Terminal, run:"
     echo '         arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
     BREW_CMD=()
-    BREW_PREFIX=""
 fi
 
-# 3. Install required Homebrew formulae if Homebrew is available
+# 3. Install required Homebrew formulae individually (using prebuilt bottles so CLT version mismatches don't block the whole batch)
 if (( ${#BREW_CMD[@]} )); then
+    export HOMEBREW_NO_AUTO_UPDATE=1
+    export HOMEBREW_NO_INSTALL_CLEANUP=1
     FORMULAE=(
         cmake
         ninja
@@ -60,24 +60,39 @@ if (( ${#BREW_CMD[@]} )); then
         robin-map
     )
     echo "Checking/installing Homebrew packages via ${BREW_CMD[*]}..."
-    "${BREW_CMD[@]}" install "${FORMULAE[@]}" || echo "[WARN] Some Homebrew formulae reported warnings; continuing..."
+    MISSING_FORMULAE=()
+    for pkg in "${FORMULAE[@]}"; do
+        if "${BREW_CMD[@]}" list --versions "$pkg" >/dev/null 2>&1; then
+            echo "[OK] Homebrew package '$pkg' already installed."
+        else
+            MISSING_FORMULAE+=("$pkg")
+        fi
+    done
+
+    if (( ${#MISSING_FORMULAE[@]} )); then
+        for pkg in "${MISSING_FORMULAE[@]}"; do
+            echo "Installing $pkg..."
+            "${BREW_CMD[@]}" install "$pkg" || echo "[WARN] Could not install '$pkg' via Homebrew; continuing..."
+        done
+    fi
 fi
 
 # 4. Initialize git submodules (fsr-vulkan, imgui, LibAtrac9, magic_enum, miniz, xbyak)
+# NOTE: Never use 'path' as a variable name in zsh/bash hybrids because zsh ties $path to $PATH!
 if [[ -f .gitmodules ]]; then
     echo "Checking third-party sources..."
     fetch_subrepo() {
-        local path=$1 url=$2 branch=${3:-}
-        if [[ ! -d "$path" ]] || [[ -z $(ls -A "$path" 2>/dev/null) ]]; then
-            echo "Cloning $path from $url..."
-            rm -rf "$path"
-            if [[ -n "$branch" ]]; then
-                git clone --depth 1 --branch "$branch" "$url" "$path"
+        local target_dir=$1 repo_url=$2 repo_branch=${3:-}
+        if [[ ! -d "$target_dir" ]] || [[ -z $(/bin/ls -A "$target_dir" 2>/dev/null) ]]; then
+            echo "Cloning $target_dir from $repo_url..."
+            /bin/rm -rf "$target_dir"
+            if [[ -n "$repo_branch" ]]; then
+                git clone --depth 1 --branch "$repo_branch" "$repo_url" "$target_dir"
             else
-                git clone --depth 1 "$url" "$path"
+                git clone --depth 1 "$repo_url" "$target_dir"
             fi
         else
-            echo "[OK] $path present."
+            echo "[OK] $target_dir present."
         fi
     }
     fetch_subrepo gpu/third_party/fsr-vulkan https://github.com/FireBurn/FSR-Vulkan.git
@@ -88,15 +103,14 @@ if [[ -f .gitmodules ]]; then
     fetch_subrepo gpu/third_party/xbyak https://github.com/herumi/xbyak.git
 fi
 
-# 5. Fetch & install header-only CMake dependencies (magic_enum, VulkanMemoryAllocator, xbyak)
+# 5. Fetch & install header-only CMake dependencies (magic_enum, VulkanMemoryAllocator, xbyak, robin-map, zydis)
 echo "Running tools/deps.sh..."
-export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
-bash tools/deps.sh
+/bin/bash tools/deps.sh
 
 # 6. Check for Vulkan ICDs (KosmicKrisp / MoltenVK)
 echo "Checking Vulkan ICD manifests..."
 ICD_FOUND=0
-for dir in "$PWD/bin" "$PWD/out/icd" /usr/local/share/vulkan/icd.d /opt/homebrew/share/vulkan/icd.d /Library/Vulkan/icd.d "$HOME/.local/share/vulkan/icd.d"; do
+for dir in "$PWD/bin" "$PWD/out/icd" /usr/local/share/vulkan/icd.d /opt/homebrew/share/vulkan/icd.d /usr/local/etc/vulkan/icd.d /opt/homebrew/etc/vulkan/icd.d /Library/Vulkan/icd.d "$HOME/.local/share/vulkan/icd.d"; do
     if [[ -d "$dir" ]]; then
         for icd in "$dir"/*.json; do
             if [[ -f "$icd" ]]; then

@@ -542,7 +542,7 @@ final class LauncherStore {
 
         Task {
             let code = await runStreamingProcess(
-                executable: "/bin/zsh",
+                executable: "/bin/bash",
                 arguments: [scriptURL.path],
                 currentDirectory: rootURL,
                 environmentOverrides: [
@@ -552,7 +552,7 @@ final class LauncherStore {
             isBuildingEngine = false
             await probeEnvironment()
             if code == 0 {
-                postNotice("macOS x86_64 runtime build succeeded!")
+                postNotice(installDepsFirst ? "macOS x86_64 dependencies bootstrapped!" : "macOS x86_64 runtime build succeeded!")
             } else {
                 postNotice("\(scriptName) exited with code \(code). Check Console Log for details.", isError: true)
             }

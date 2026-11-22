@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SacredFire: header-only dependencies of gpu/ that the host's package manager does not carry
-# (magic_enum, VulkanMemoryAllocator, xbyak). Pinned tags are cloned into out/deps/src and
+# (magic_enum, VulkanMemoryAllocator, xbyak, tsl-robin-map). Pinned tags are cloned into out/deps/src and
 # installed with their own CMake into out/deps/prefix; build.sh adds that prefix to
 # CMAKE_PREFIX_PATH. Idempotent: an installed package is skipped. DEPS_PREFIX overrides the prefix.
 set -euo pipefail
@@ -24,4 +24,5 @@ fetch_and_install magic_enum https://github.com/Neargye/magic_enum.git v0.9.7 \
 fetch_and_install VulkanMemoryAllocator https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git v3.3.0 \
     include/vk_mem_alloc.h
 fetch_and_install xbyak https://github.com/herumi/xbyak.git v7.30 include/xbyak/xbyak.h
+fetch_and_install robin-map https://github.com/Tessil/robin-map.git v1.3.0 include/tsl/robin_map.h -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 echo "deps: prefix $prefix"
