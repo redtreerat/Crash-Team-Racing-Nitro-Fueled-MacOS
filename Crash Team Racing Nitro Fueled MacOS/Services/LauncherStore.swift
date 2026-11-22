@@ -225,8 +225,12 @@ final class LauncherStore {
             let icdSearchDirs = [
                 engineRoot.appendingPathComponent("bin").path,
                 engineRoot.appendingPathComponent("out/icd").path,
+                engineRoot.appendingPathComponent("out/deps/prefix/share/vulkan/icd.d").path,
+                engineRoot.appendingPathComponent("out/deps/prefix/etc/vulkan/icd.d").path,
                 "/usr/local/share/vulkan/icd.d",
+                "/usr/local/etc/vulkan/icd.d",
                 "/opt/homebrew/share/vulkan/icd.d",
+                "/opt/homebrew/etc/vulkan/icd.d",
                 "/Library/Vulkan/icd.d",
                 "\(NSHomeDirectory())/.local/share/vulkan/icd.d",
             ]

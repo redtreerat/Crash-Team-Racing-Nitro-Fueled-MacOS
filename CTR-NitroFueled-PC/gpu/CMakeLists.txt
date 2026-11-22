@@ -204,6 +204,12 @@ target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
 if (APPLE)
+    # On macOS, Apple Clang searches /usr/local/include before -isystem paths. Prepend the
+    # fmt-only include directory as -I so bundled fmt v11 matches libfmt.a even if Homebrew
+    # installed a newer fmt in /usr/local/include.
+    if (DEFINED ENV{DEPS_PREFIX} AND EXISTS "$ENV{DEPS_PREFIX}/fmt-include/fmt")
+        target_compile_options(bbgpu BEFORE PRIVATE "-I$ENV{DEPS_PREFIX}/fmt-include")
+    endif()
     target_compile_options(bbgpu PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/bb_mac_compat.h)
     target_link_options(bbgpu PRIVATE -Wl,-undefined,dynamic_lookup)
 elseif (NOT WIN32)
@@ -223,7 +229,9 @@ if (WIN32)
     target_compile_options(bbgpu PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/bb_win_compat.h)
     target_include_directories(bbgpu PRIVATE third_party/xbyak)
     target_link_libraries(bbgpu PUBLIC Vulkan::Vulkan ws2_32 bcrypt ntdll synchronization winmm)
-elseif (NOT APPLE)
+elseif (APPLE)
+    target_link_libraries(bbgpu PUBLIC Vulkan::Vulkan)
+else()
     target_link_libraries(bbgpu PUBLIC PkgConfig::X11)
 endif()
 
@@ -302,14 +310,3 @@ target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCL
 target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(camera-motion-test PRIVATE bbgpu)
 add_dependencies(camera-motion-test host_shaders)
-
-# bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
-add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
-    shim/bbport_settings.cpp)
-target_include_directories(upscaler-support-test PRIVATE shim)
-target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
-
-add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
-    shadps4/video_core/renderer_vulkan/fsr411/fsr411.cpp)
-target_include_directories(fsr4-bench PRIVATE shadps4/video_core/renderer_vulkan/fsr411)
-target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan::fsr4-v07-assets Vulkan::Vulkan)

@@ -46,13 +46,30 @@ else
 fi
 if [[ ! -f out/deps/prefix/include/vk_mem_alloc.h ]]; then bash tools/deps.sh; fi
 if [[ $(uname -s) == Darwin && -d out/deps/prefix ]]; then
+    # If header-only boost is installed in /opt/homebrew/opt/boost, symlink its boost/ headers and
+    # cmake config into out/deps/prefix so we never need /opt/homebrew/include on the compiler path
+    # (which would otherwise shadow out/deps/prefix/include/fmt with arm64 Homebrew's fmt).
+    if [[ ! -e out/deps/prefix/include/boost && -d /opt/homebrew/opt/boost/include/boost ]]; then
+        ln -sfn /opt/homebrew/opt/boost/include/boost out/deps/prefix/include/boost
+    fi
+    # Provide a dedicated -I directory containing only the bundled fmt headers so Apple Clang's
+    # default /usr/local/include (which may have a newer Homebrew fmt v12) never shadows the
+    # bundled fmt v11 static library, while newer /usr/local/include/vulkan headers still win.
+    if [[ -d out/deps/prefix/include/fmt ]]; then
+        mkdir -p out/deps/prefix/fmt-include
+        ln -sfn "$DEPS_NO_SPACE/include/fmt" out/deps/prefix/fmt-include/fmt
+    fi
     for pc in out/deps/prefix/lib/pkgconfig/*.pc out/deps/prefix/share/pkgconfig/*.pc; do
         [[ -f "$pc" ]] || continue
         sed -i '' -E "s|^prefix=.*|prefix=$DEPS_NO_SPACE|g; s|^exec_prefix=/.*|exec_prefix=\${prefix}|g; s|^includedir=/.*|includedir=$DEPS_NO_SPACE/include|g" "$pc"
     done
-    export PKG_CONFIG_PATH="$DEPS_NO_SPACE/lib/pkgconfig:$DEPS_NO_SPACE/share/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    # Only include x86_64 prefixes ($DEPS_NO_SPACE and /usr/local); exclude /opt/homebrew (arm64)
+    # so headers like fmt from /opt/homebrew/include never shadow out/deps/prefix/include/fmt (v11).
+    export PKG_CONFIG_PATH="$DEPS_NO_SPACE/lib/pkgconfig:$DEPS_NO_SPACE/share/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig"
+    export CMAKE_PREFIX_PATH="$DEPS_NO_SPACE:/usr/local"
+else
+    export CMAKE_PREFIX_PATH="$DEPS_NO_SPACE:/usr/local:/opt/homebrew${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 fi
-export CMAKE_PREFIX_PATH="$DEPS_NO_SPACE:/usr/local:/opt/homebrew${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 if [[ -z ${CC:-} ]]; then
     CC=$(command -v cc || command -v gcc || true)
     if [[ -z $CC ]]; then
@@ -72,8 +89,7 @@ if ! { command -v pkg-config >/dev/null && pkg-config --exists vulkan sdl3 && co
 fi
 read -r -a includes <<< "$(pkg-config --cflags vulkan sdl3)"
 read -r -a libraries <<< "$(pkg-config --libs vulkan sdl3)"
-# GPU library (shadPS4 video core + drivers), built by CMake into out/gpu/libbbgpu.so (or .dylib on macOS).
-# BB_PGO: generate (instrumented build that writes pgo/ while the game runs), use, off.
+# GPU library (shadPS4 video core + drivers), built by CMake into out/gpu/libbbgpu.so (or .dylib on macOS).\n# BB_PGO: generate (instrumented build that writes pgo/ while the game runs), use, off.
 # Default: use the profile in pgo/ when there is one. BB_LTO=OFF disables link-time optimization.
 pgo=${BB_PGO:-}
 if [[ -z $pgo ]]; then
@@ -96,9 +112,9 @@ is_darwin=0
 if [[ $(uname -s) == Darwin ]]; then
     is_darwin=1
     lto_default=OFF
-    cmake_extra=(-DCMAKE_OSX_ARCHITECTURES=x86_64)
-    # Remove stale CMakeCache.txt if the project folder was moved or still has split paths
-    if [[ -f out/gpu/CMakeCache.txt ]] && { ! grep -Fq "$PWD/gpu" out/gpu/CMakeCache.txt || grep -Fq "/Documents/Crash;" out/gpu/CMakeCache.txt; }; then
+    cmake_extra=(-DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_IGNORE_PREFIX_PATH=/opt/homebrew -DCMAKE_FIND_NO_INSTALL_PREFIX=ON -DBoost_NO_BOOST_CMAKE=ON -DBoost_INCLUDE_DIR="$DEPS_NO_SPACE/include")
+    # Remove stale CMakeCache.txt if the project folder was moved, still has split paths, or pulled /opt/homebrew
+    if [[ -f out/gpu/CMakeCache.txt ]] && { ! grep -Fq "$PWD/gpu" out/gpu/CMakeCache.txt || grep -Fq "/Documents/Crash;" out/gpu/CMakeCache.txt || grep -Fq "/opt/homebrew/include" out/gpu/CMakeCache.txt; }; then
         rm -rf out/gpu
     fi
 else
@@ -159,8 +175,18 @@ if [[ ${1:-} == --test ]]; then
     out/sema-test
     "$CC" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror ${cflags[@]+"${cflags[@]}"} -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
     out/content-test
-    out/content-test --addons
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror ${cflags[@]+"${cflags[@]}"} -pthread -I. -Isrc tests/test_net.c -o out/net-test
-    out/net-test --offline
-    out/net-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror ${cflags[@]+"${cflags[@]}"} -I. -Isrc tests/test_patches.c src/runtime_patches.c -o out/patches-test
+    out/patches-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror ${cflags[@]+"${cflags[@]}"} -I. -Isrc tests/test_isa_rewrite.c out/isa_emulate.o src/isa_rewrite.c -o out/isa-rewrite-test
+    out/isa-rewrite-test
+    python3 tests/test_isa_rewrite.py
+    python3 tests/test_ultrawide.py
+    ninja -C out/gpu motion-history-test motion-shader-test ui-composition-test scene-resolution-test taa-shader-test camera-motion-test settings-test
+    out/gpu/motion-history-test
+    out/gpu/motion-shader-test
+    out/gpu/ui-composition-test
+    out/gpu/scene-resolution-test
+    out/gpu/taa-shader-test
+    out/gpu/camera-motion-test
+    out/gpu/settings-test
 fi

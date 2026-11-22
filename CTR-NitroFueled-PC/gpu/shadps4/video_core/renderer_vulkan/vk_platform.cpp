@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #ifdef __APPLE__
+#include <dlfcn.h>
 #include <mach-o/dyld.h>
 #endif
 
@@ -264,26 +265,70 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     LOG_INFO(Render_Vulkan, "Creating vulkan instance");
 
 #if defined(__APPLE__)
-    // Only point VK_DRIVER_FILES at the executable directory if neither VK_DRIVER_FILES nor
-    // VK_ICD_FILENAMES is already set in the environment and a bundled ICD JSON exists next to
-    // the executable (never clobber KosmicKrisp / MoltenVK configured by the launcher or user).
+    // Discover KosmicKrisp / MoltenVK ICD manifest if neither VK_DRIVER_FILES nor VK_ICD_FILENAMES
+    // is already set in the environment.
     if (!std::getenv("VK_DRIVER_FILES") && !std::getenv("VK_ICD_FILENAMES")) {
+        std::vector<std::filesystem::path> icd_candidates;
         char path[PATH_MAX];
         u32 length = PATH_MAX;
         if (_NSGetExecutablePath(path, &length) == 0) {
             const auto dir = std::filesystem::path(path).parent_path();
-            if (std::filesystem::exists(dir / "MoltenVK_icd.json") ||
-                std::filesystem::exists(dir / "kosmickrisp_mesa_icd.x86_64.json") ||
-                std::filesystem::exists(dir / "kosmickrisp_icd.json")) {
-                setenv("VK_DRIVER_FILES", dir.c_str(), 0);
+            icd_candidates.push_back(dir / "kosmickrisp_mesa_icd.x86_64.json");
+            icd_candidates.push_back(dir / "kosmickrisp_icd.json");
+            icd_candidates.push_back(dir / "MoltenVK_icd.json");
+            icd_candidates.push_back(dir / "icd" / "kosmickrisp_mesa_icd.x86_64.json");
+            icd_candidates.push_back(dir / "icd" / "MoltenVK_icd.json");
+            icd_candidates.push_back(dir / "deps" / "prefix" / "share" / "vulkan" / "icd.d" / "kosmickrisp_mesa_icd.x86_64.json");
+            icd_candidates.push_back(dir / "deps" / "prefix" / "share" / "vulkan" / "icd.d" / "MoltenVK_icd.json");
+            icd_candidates.push_back(dir / "deps" / "prefix" / "etc" / "vulkan" / "icd.d" / "MoltenVK_icd.json");
+        }
+        icd_candidates.emplace_back("/usr/local/share/vulkan/icd.d/kosmickrisp_mesa_icd.x86_64.json");
+        icd_candidates.emplace_back("/usr/local/etc/vulkan/icd.d/kosmickrisp_mesa_icd.x86_64.json");
+        icd_candidates.emplace_back("/usr/local/share/vulkan/icd.d/MoltenVK_icd.json");
+        icd_candidates.emplace_back("/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json");
+        for (const auto& candidate : icd_candidates) {
+            if (std::filesystem::exists(candidate)) {
+                setenv("VK_DRIVER_FILES", candidate.c_str(), 0);
+                setenv("VK_ICD_FILENAMES", candidate.c_str(), 0);
+                break;
             }
         }
     }
 #endif
 
+    // Note: vk::detail::DynamicLoader has a deleted move constructor, so return by value from a
+    // lambda invokes DynamicLoader(const DynamicLoader&) = default; and then ~DynamicLoader() on
+    // the temporary, which calls dlclose(m_library) and invalidates the handle!
+#if defined(__APPLE__)
+    static void* vulkan_lib_handle = []() -> void* {
+        const char* candidates[] = {
+            "@rpath/libvulkan.1.dylib",
+            "@rpath/libvulkan.dylib",
+            "/tmp/ctr-nf-mac-deps/lib/libvulkan.1.dylib",
+            "/usr/local/lib/libvulkan.1.dylib",
+            "libvulkan.1.dylib",
+        };
+        for (const char* candidate : candidates) {
+            if (void* h = dlopen(candidate, RTLD_NOW | RTLD_LOCAL)) {
+                return h;
+            }
+        }
+        return RTLD_DEFAULT;
+    }();
+    auto get_instance_proc_addr =
+        reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(vulkan_lib_handle, "vkGetInstanceProcAddr"));
+    if (!get_instance_proc_addr) {
+        get_instance_proc_addr =
+            reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr"));
+    }
+#else
     static vk::detail::DynamicLoader dl;
-    VULKAN_HPP_DEFAULT_DISPATCHER.init(
-        dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+    auto get_instance_proc_addr =
+        dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+#endif
+    ASSERT_MSG(get_instance_proc_addr != nullptr,
+               "Failed to load vkGetInstanceProcAddr from libvulkan.1.dylib");
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
     const auto [available_version_result, available_version] =
         VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion
@@ -423,23 +468,34 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     }
 #endif
 
-    vk::StructureChain<vk::InstanceCreateInfo, vk::LayerSettingsCreateInfoEXT> instance_ci_chain = {
-        vk::InstanceCreateInfo{
-            .flags = instance_flags,
-            .pApplicationInfo = &application_info,
-            .enabledLayerCount = static_cast<u32>(layers.size()),
-            .ppEnabledLayerNames = layers.data(),
-            .enabledExtensionCount = static_cast<u32>(extensions.size()),
-            .ppEnabledExtensionNames = extensions.data(),
-        },
-        vk::LayerSettingsCreateInfoEXT{
-            .settingCount = layer_setings.size(),
-            .pSettings = layer_setings.data(),
-        },
+    const vk::LayerSettingsCreateInfoEXT layer_settings_ci = {
+        .settingCount = static_cast<u32>(layer_setings.size()),
+        .pSettings = layer_setings.data(),
     };
 
-    auto [instance_result, instance] = vk::createInstanceUnique(instance_ci_chain.get());
-    ASSERT_MSG(instance_result == vk::Result::eSuccess, "Failed to create instance: {}",
+    const vk::DebugUtilsMessengerCreateInfoEXT debug_info = {
+        .pNext = !layers.empty() ? &layer_settings_ci : nullptr,
+        .messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
+                           vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
+                           vk::DebugUtilsMessageSeverityFlagBitsEXT::eError,
+        .messageType = vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
+                       vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation |
+                       vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance,
+        .pfnUserCallback = DebugUtilsCallback,
+    };
+
+    const vk::InstanceCreateInfo instance_ci = {
+        .pNext = &debug_info,
+        .flags = instance_flags,
+        .pApplicationInfo = &application_info,
+        .enabledLayerCount = static_cast<u32>(layers.size()),
+        .ppEnabledLayerNames = layers.data(),
+        .enabledExtensionCount = static_cast<u32>(extensions.size()),
+        .ppEnabledExtensionNames = extensions.data(),
+    };
+
+    auto [instance_result, instance] = vk::createInstanceUnique(instance_ci);
+    ASSERT_MSG(instance_result == vk::Result::eSuccess, "Failed to create Vulkan instance: {}",
                vk::to_string(instance_result));
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*instance);
@@ -448,17 +504,17 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 }
 
 vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance) {
-    const vk::DebugUtilsMessengerCreateInfoEXT msg_ci = {
+    const vk::DebugUtilsMessengerCreateInfoEXT debug_info = {
         .messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
-                           vk::DebugUtilsMessageSeverityFlagBitsEXT::eError |
                            vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
+                           vk::DebugUtilsMessageSeverityFlagBitsEXT::eError |
                            vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose,
         .messageType = vk::DebugUtilsMessageTypeFlagBitsEXT::eGeneral |
                        vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation |
                        vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance,
         .pfnUserCallback = DebugUtilsCallback,
     };
-    auto [messenger_result, messenger] = instance.createDebugUtilsMessengerEXTUnique(msg_ci);
+    auto [messenger_result, messenger] = instance.createDebugUtilsMessengerEXTUnique(debug_info);
     ASSERT_MSG(messenger_result == vk::Result::eSuccess, "Failed to create debug callback: {}",
                vk::to_string(messenger_result));
     return std::move(messenger);

@@ -282,6 +282,24 @@ def main():
         # Under Rosetta 2 on Apple Silicon (macOS 15+), AVX instructions execute natively via
         # translation, while CPUID may omit the AVX bit depending on OS/sysctl settings.
         env.setdefault('BB_SKIP_CPU_CHECK', '1')
+        if not env.get('VK_DRIVER_FILES') and not env.get('VK_ICD_FILENAMES'):
+            for icd in (
+                PORT / 'bin' / 'kosmickrisp_mesa_icd.x86_64.json',
+                PORT / 'out' / 'icd' / 'kosmickrisp_mesa_icd.x86_64.json',
+                PORT / 'out' / 'deps' / 'prefix' / 'share' / 'vulkan' / 'icd.d' / 'kosmickrisp_mesa_icd.x86_64.json',
+                Path('/usr/local/share/vulkan/icd.d/kosmickrisp_mesa_icd.x86_64.json'),
+                Path('/usr/local/etc/vulkan/icd.d/kosmickrisp_mesa_icd.x86_64.json'),
+                PORT / 'bin' / 'MoltenVK_icd.json',
+                PORT / 'out' / 'icd' / 'MoltenVK_icd.json',
+                PORT / 'out' / 'deps' / 'prefix' / 'share' / 'vulkan' / 'icd.d' / 'MoltenVK_icd.json',
+                PORT / 'out' / 'deps' / 'prefix' / 'etc' / 'vulkan' / 'icd.d' / 'MoltenVK_icd.json',
+                Path('/usr/local/share/vulkan/icd.d/MoltenVK_icd.json'),
+                Path('/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json'),
+            ):
+                if icd.is_file():
+                    env['VK_DRIVER_FILES'] = str(icd)
+                    env['VK_ICD_FILENAMES'] = str(icd)
+                    break
     # Instruction sets this CPU lacks (MOVBE, BMI1, LZCNT): the ISA rewrite covers them; exit 20
     # is a set nothing covers.
     features = subprocess.run([str(probe), '--cpu-features'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,

@@ -4,10 +4,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __APPLE__
+#include <unistd.h>
+#endif
 #define CHECK(call) do { VkResult r = (call); if (r != VK_SUCCESS) { \
     fprintf(stderr, "Vulkan: %s returned %d\n", #call, r); exit(1); } } while (0)
 
 int vulkan_smoke(void) {
+#ifdef __APPLE__
+    if (!getenv("VK_DRIVER_FILES") && !getenv("VK_ICD_FILENAMES")) {
+        static const char *const icd_candidates[] = {
+            "/usr/local/share/vulkan/icd.d/kosmickrisp_mesa_icd.x86_64.json",
+            "/usr/local/etc/vulkan/icd.d/kosmickrisp_mesa_icd.x86_64.json",
+            "/usr/local/share/vulkan/icd.d/MoltenVK_icd.json",
+            "/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json",
+        };
+        for (size_t i = 0; i < sizeof(icd_candidates) / sizeof(icd_candidates[0]); ++i) {
+            if (access(icd_candidates[i], R_OK) == 0) {
+                setenv("VK_DRIVER_FILES", icd_candidates[i], 0);
+                setenv("VK_ICD_FILENAMES", icd_candidates[i], 0);
+                break;
+            }
+        }
+    }
+#endif
     VkApplicationInfo app = {.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName="SacredFire native probe", .apiVersion=VK_API_VERSION_1_0};
 #ifdef __APPLE__
     const char *inst_exts[] = { VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME, "VK_KHR_get_physical_device_properties2" };
