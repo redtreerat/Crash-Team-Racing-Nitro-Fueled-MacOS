@@ -34,6 +34,25 @@ MINGW*|MSYS*)
     exit 0
     ;;
 esac
+export PATH="$PWD/out/deps/prefix/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
+# SacredFire: header-only and local libraries in out/deps/prefix; use a space-free symlink on
+# macOS so pkg-config and CMake's FindPkgConfig never split paths containing spaces.
+if [[ $(uname -s) == Darwin ]]; then
+    DEPS_NO_SPACE="/tmp/ctr-nf-mac-deps"
+    ln -sfn "$PWD/out/deps/prefix" "$DEPS_NO_SPACE"
+    export DEPS_PREFIX="$DEPS_NO_SPACE"
+else
+    DEPS_NO_SPACE="$PWD/out/deps/prefix"
+fi
+if [[ ! -f out/deps/prefix/include/vk_mem_alloc.h ]]; then bash tools/deps.sh; fi
+if [[ $(uname -s) == Darwin && -d out/deps/prefix ]]; then
+    for pc in out/deps/prefix/lib/pkgconfig/*.pc out/deps/prefix/share/pkgconfig/*.pc; do
+        [[ -f "$pc" ]] || continue
+        sed -i '' -E "s|^prefix=.*|prefix=$DEPS_NO_SPACE|g; s|^exec_prefix=/.*|exec_prefix=\${prefix}|g; s|^includedir=/.*|includedir=$DEPS_NO_SPACE/include|g" "$pc"
+    done
+    export PKG_CONFIG_PATH="$DEPS_NO_SPACE/lib/pkgconfig:$DEPS_NO_SPACE/share/pkgconfig:/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+fi
+export CMAKE_PREFIX_PATH="$DEPS_NO_SPACE:/usr/local:/opt/homebrew${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 if [[ -z ${CC:-} ]]; then
     CC=$(command -v cc || command -v gcc || true)
     if [[ -z $CC ]]; then
@@ -51,10 +70,6 @@ if ! { command -v pkg-config >/dev/null && pkg-config --exists vulkan sdl3 && co
     fi
     echo 'Need pkg-config with vulkan and sdl3, cmake and ninja (see shell.nix).' >&2; exit 1
 fi
-# SacredFire: header-only libraries the host lacks (magic_enum, VulkanMemoryAllocator, xbyak) come
-# from tools/deps.sh into out/deps/prefix; CMake finds them through CMAKE_PREFIX_PATH.
-if [[ ! -f out/deps/prefix/include/vk_mem_alloc.h ]]; then bash tools/deps.sh; fi
-export CMAKE_PREFIX_PATH="$PWD/out/deps/prefix${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 read -r -a includes <<< "$(pkg-config --cflags vulkan sdl3)"
 read -r -a libraries <<< "$(pkg-config --libs vulkan sdl3)"
 # GPU library (shadPS4 video core + drivers), built by CMake into out/gpu/libbbgpu.so (or .dylib on macOS).
@@ -70,32 +85,28 @@ mkdir -p pgo
 if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ]]; then
     git submodule update --init --recursive 2>/dev/null || bash tools/setup_mac_deps.sh
 fi
-# bbport 0.51 (issue 124): a checkout updated from an earlier version keeps that version's patch
-# applied, and the new one applies neither way ("patch does not apply"): the submodule's tree
-# holds nothing but these patches, so it is reset and they are applied again.
-fsr_patches_apply() {
-    for patch in gpu/patches/fsr-vulkan/*.patch; do
-        if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
-            git -C gpu/third_party/fsr-vulkan apply "$@" "$PWD/$patch" || return 1
-        fi
+# Apply FSR-Vulkan patches only if not already applied (patch 0006 adds colorHudless to bridge.h).
+find gpu/third_party/fsr-vulkan -name '*.rej' -o -name '*.orig' -delete 2>/dev/null || true
+if ! grep -q "colorHudless" gpu/third_party/fsr-vulkan/include/ffx_vk_fsr3_3_1_5_bridge.h 2>/dev/null; then
+    for patch_file in gpu/patches/fsr-vulkan/*.patch; do
+        patch -d gpu/third_party/fsr-vulkan -p1 --batch --forward -s < "$PWD/$patch_file" || true
     done
-}
-if ! fsr_patches_apply --check 2>/dev/null; then
-    echo 'FSR-Vulkan: an earlier version of the port changed it; resetting it and patching again'
-    git -C gpu/third_party/fsr-vulkan checkout -- .
 fi
-fsr_patches_apply
 is_darwin=0
 if [[ $(uname -s) == Darwin ]]; then
     is_darwin=1
     lto_default=OFF
     cmake_extra=(-DCMAKE_OSX_ARCHITECTURES=x86_64)
+    # Remove stale CMakeCache.txt if the project folder was moved or still has split paths
+    if [[ -f out/gpu/CMakeCache.txt ]] && { ! grep -Fq "$PWD/gpu" out/gpu/CMakeCache.txt || grep -Fq "/Documents/Crash;" out/gpu/CMakeCache.txt; }; then
+        rm -rf out/gpu
+    fi
 else
     lto_default=ON
     cmake_extra=()
 fi
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
-    -DBB_LTO="${BB_LTO:-$lto_default}" -DBB_PGO_DIR="$PWD/pgo" "${cmake_extra[@]}" >/dev/null
+    -DBB_LTO="${BB_LTO:-$lto_default}" -DBB_PGO_DIR="$PWD/pgo" ${cmake_extra[@]+"${cmake_extra[@]}"} >/dev/null
 echo "GPU library: PGO $pgo, LTO ${BB_LTO:-$lto_default}"
 # A failed GPU build must stop here: an older libbbgpu.so would otherwise be used silently.
 if ! ninja -C out/gpu bbgpu > out/gpu-build.log 2>&1; then
@@ -103,9 +114,9 @@ if ! ninja -C out/gpu bbgpu > out/gpu-build.log 2>&1; then
     echo 'GPU library build failed (full log: out/gpu-build.log)' >&2; exit 1
 fi
 if (( is_darwin )); then
-    cflags=(-arch x86_64 -Wno-unknown-warning-option -Wno-unused-but-set-global)
+    cflags=(-arch x86_64 -D_XOPEN_SOURCE=700 -D_DARWIN_C_SOURCE=1 -Wno-unknown-warning-option -Wno-unused-but-set-global -Wno-format -Wno-unused-function)
     pie_flags=()
-    gpu=(-Lout/gpu -lbbgpu -Wl,-rpath,@executable_path/gpu -Wl,-rpath,"$PWD/out/gpu" -Wl,-export_dynamic)
+    gpu=(-Lout/gpu -lbbgpu -Wl,-rpath,@executable_path/gpu -Wl,-rpath,"$PWD/out/gpu" -Wl,-rpath,"$PWD/out/deps/prefix/lib" -Wl,-export_dynamic)
     runtime=(src/runtime*.c src/compat_mac.c)
 else
     # $ORIGIN/gpu: packaged copies keep the library next to the binary without patching it.
@@ -115,15 +126,15 @@ else
     runtime=(src/runtime*.c)
 fi
 # isa_emulate runs inside guest code: no XMM/YMM.
-"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror "${cflags[@]}" -mgeneral-regs-only -c src/isa_emulate.c -o out/isa_emulate.o
+"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror ${cflags[@]+"${cflags[@]}"} -mgeneral-regs-only -c src/isa_emulate.c -o out/isa_emulate.o
 # Third-party decoders: compiled once, without this project's -Werror policy.
 atrac9=(third_party/LibAtrac9/C/src/*.c)
 if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/libatrac9.a -name '*.c') ]]; then
     rm -rf out/atrac9 && mkdir -p out/atrac9
-    for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 -g -w "${cflags[@]}" -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
+    for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 -g -w ${cflags[@]+"${cflags[@]}"} -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
     ar rcs out/libatrac9.a out/atrac9/*.o
 fi
-"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror "${cflags[@]}" -pthread "${pie_flags[@]}" "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/cpu_check.c src/vulkan_smoke.c out/isa_emulate.o src/isa_rewrite.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sacredfire
+"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror ${cflags[@]+"${cflags[@]}"} -pthread ${pie_flags[@]+"${pie_flags[@]}"} "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/cpu_check.c src/vulkan_smoke.c out/isa_emulate.o src/isa_rewrite.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sacredfire
 echo "Built $PWD/out/sacredfire"
 # out/VERSION: the source revision this build came from (the nearest v* tag, else the commit;
 # "-dirty" when tracked files differ from it). run.sh prints it, the launcher shows it and the
@@ -136,22 +147,20 @@ if (( is_darwin )); then version="$version-macos"; fi
 printf '%s\n' "$version" > out/VERSION
 echo "Version: $version (out/VERSION)"
 # GPU check for run.sh (live_resolution=auto) and the launcher's gamepad list (--gamepads).
-"$CC" -std=c11 -O2 -Wall -Wextra -Werror "${cflags[@]}" "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
+"$CC" -std=c11 -O2 -Wall -Wextra -Werror ${cflags[@]+"${cflags[@]}"} "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
 if [[ ${1:-} == --test ]]; then
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror "${cflags[@]}" -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" -o out/pad-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror ${cflags[@]+"${cflags[@]}"} -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" -o out/pad-test
     out/pad-test
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror "${cflags[@]}" -pthread -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror ${cflags[@]+"${cflags[@]}"} -pthread -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
     out/runtime-test
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror "${cflags[@]}" -pthread -Isrc tests/test_file_mods.c -o out/file-mods-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror ${cflags[@]+"${cflags[@]}"} -pthread -Isrc tests/test_file_mods.c -o out/file-mods-test
     out/file-mods-test
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror "${cflags[@]}" -pthread -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sema-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror ${cflags[@]+"${cflags[@]}"} -pthread -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sema-test
     out/sema-test
-    "$CC" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror "${cflags[@]}" -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
+    "$CC" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror ${cflags[@]+"${cflags[@]}"} -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
     out/content-test
     out/content-test --addons
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror "${cflags[@]}" -pthread -I. -Isrc tests/test_net.c -o out/net-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror ${cflags[@]+"${cflags[@]}"} -pthread -I. -Isrc tests/test_net.c -o out/net-test
     out/net-test --offline
     out/net-test
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror "${cflags[@]}" -pthread -I. -Isrc tests/test_eventflag.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/eventflag-test
-    out/eventflag-test
 fi

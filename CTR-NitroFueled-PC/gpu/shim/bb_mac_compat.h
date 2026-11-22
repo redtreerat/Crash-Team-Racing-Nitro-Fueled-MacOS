@@ -3,6 +3,12 @@
 // identity. Force-included into the GPU library on macOS (CMakeLists.txt).
 #pragma once
 #ifdef __APPLE__
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>

@@ -4,298 +4,252 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cinttypes>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <x86intrin.h>
 #ifndef _WIN32
 #include <pthread.h>
 #include <sys/mman.h>
-#include <sys/ucontext.h>
+#include <ucontext.h>
 #include <unistd.h>
 #endif
 
 namespace BbClobber {
 namespace {
-constexpr std::uint64_t PageSize = 4096;
-constexpr std::uint64_t TableSlots = 1 << 16; // 65 536 4K pages = 256 MiB active window
+constexpr std::size_t Page = 4096;
 
-struct Slot {
-    std::atomic<std::uint64_t> page{0};
-    std::atomic<std::uint64_t> submit{0};
-    std::atomic<std::uint64_t> submission_id{0};
-    std::atomic<std::uint64_t> first_write{0};
-    std::atomic<std::uint64_t> last_write{0};
-    std::atomic<std::uint32_t> write_count{0};
-    std::atomic<std::uint32_t> source{0}; // 1 = fault, 2 = submission scan
-    std::atomic<std::uint64_t> first_address{0};
-    std::atomic<std::uint64_t> first_rip{0};
-    char first_thread[16]{};
+std::uint64_t NowNs() {
+    return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count());
+}
+
+const char* SourceName(std::uint32_t source) {
+    switch (source) {
+    case Eop: return "EOP fence";
+    case Eos: return "EOS fence";
+    case EosGds: return "EOS GDS store";
+    case ReleaseMem: return "RELEASE_MEM fence";
+    case WriteData: return "WRITE_DATA";
+    case ComputeWriteData: return "compute WRITE_DATA";
+    case DmaFill: return "DMA fill";
+    case DmaCopy: return "DMA copy";
+    case BufferDownload: return "buffer download";
+    case ImageDownload: return "image download";
+    case ConstRam: return "DUMP_CONST_RAM";
+    default: return "?";
+    }
+}
+
+// Submitted command buffers (SubmitGfx order); the game reuses their memory every frame.
+struct Range {
+    std::uint64_t seq, base, bytes, ns;
 };
+std::array<Range, 256> ranges;
+std::atomic<std::uint64_t> ranges_head{0};
+std::atomic<std::uint64_t> decoding{0};
 
-std::array<Slot, TableSlots> slots{};
+// The port's writes into guest memory.
+struct Write {
+    std::uint64_t address, value, ns, decoding;
+    std::uint32_t bytes, source, tid, pad;
+};
+std::array<Write, 16384> writes;
+std::atomic<std::uint64_t> writes_head{0};
+std::atomic<std::uint64_t> hits{0};
 
-std::atomic<std::uint64_t> current_submission_id{0};
-std::atomic<std::uint64_t> submissions{0};
-std::atomic<std::uint64_t> command_pages{0};
-std::atomic<std::uint64_t> vertex_pages{0};
-std::atomic<std::uint64_t> writes_to_watched_pages{0};
-std::atomic<std::uint64_t> clobbered_pages{0};
-std::atomic<std::uint64_t> clobbered_under_1ms{0};
-std::atomic<std::uint64_t> clobbered_under_5ms{0};
-std::atomic<std::uint64_t> clobbered_under_20ms{0};
-std::atomic<std::uint64_t> report_due{0};
+// BB_COPY_PROTECT: the read-only copies.
+struct Protected {
+    std::atomic<std::uint64_t> base{0}, bytes{0}, seq{0};
+};
+std::array<Protected, 64> protected_copies;
 
-std::uint64_t Rdtsc() {
-    return __rdtsc();
-}
-
-double TscToMs(std::uint64_t ticks) {
-    // A rough 3 GHz scale for bucketing and logs; the ratios are what matter.
-    return static_cast<double>(ticks) / 3.0e6;
-}
-
-Slot* FindOrClaim(std::uint64_t page) {
-    const std::uint64_t start = ((page >> 12) * 0x9e3779b97f4a7c15ull) & (TableSlots - 1);
-    for (std::uint64_t probe = 0; probe < 16; ++probe) {
-        Slot& s = slots[(start + probe) & (TableSlots - 1)];
-        std::uint64_t cur = s.page.load(std::memory_order_relaxed);
-        if (cur == page) {
-            return &s;
-        }
-        if (cur == 0) {
-            if (s.page.compare_exchange_strong(cur, page, std::memory_order_relaxed) ||
-                cur == page) {
-                return &s;
-            }
-        }
-    }
-    // Evict the oldest slot in the probe window.
-    Slot& victim = slots[start];
-    victim.page.store(page, std::memory_order_relaxed);
-    victim.submit.store(0, std::memory_order_relaxed);
-    victim.first_write.store(0, std::memory_order_relaxed);
-    victim.last_write.store(0, std::memory_order_relaxed);
-    victim.write_count.store(0, std::memory_order_relaxed);
-    victim.source.store(0, std::memory_order_relaxed);
-    return &victim;
-}
-
-Slot* Find(std::uint64_t page) {
-    const std::uint64_t start = ((page >> 12) * 0x9e3779b97f4a7c15ull) & (TableSlots - 1);
-    for (std::uint64_t probe = 0; probe < 16; ++probe) {
-        Slot& s = slots[(start + probe) & (TableSlots - 1)];
-        const std::uint64_t cur = s.page.load(std::memory_order_relaxed);
-        if (cur == page) {
-            return &s;
-        }
-        if (cur == 0) {
-            return nullptr;
-        }
-    }
-    return nullptr;
-}
-
-void TouchRange(std::uint64_t address, std::uint64_t bytes, std::uint32_t kind) {
-    if (address == 0 || bytes == 0) {
-        return;
-    }
-    const std::uint64_t now = Rdtsc();
-    const std::uint64_t id = current_submission_id.load(std::memory_order_relaxed);
-    const std::uint64_t first_page = address & ~(PageSize - 1);
-    const std::uint64_t last_page = (address + bytes - 1) & ~(PageSize - 1);
-    // Cap at 64 pages per range so a large buffer does not flood the table.
-    std::uint64_t count = 0;
-    for (std::uint64_t page = first_page; page <= last_page && count < 64;
-         page += PageSize, ++count) {
-        Slot* s = FindOrClaim(page);
-        s->submit.store(now, std::memory_order_relaxed);
-        s->submission_id.store(id, std::memory_order_relaxed);
-        s->first_write.store(0, std::memory_order_relaxed);
-        s->last_write.store(0, std::memory_order_relaxed);
-        s->write_count.store(0, std::memory_order_relaxed);
-        s->source.store(kind, std::memory_order_relaxed);
-    }
-    if (kind == 1) {
-        command_pages.fetch_add(count, std::memory_order_relaxed);
-    } else {
-        vertex_pages.fetch_add(count, std::memory_order_relaxed);
-    }
-}
-
-void RecordWrite(Slot* s, std::uint64_t address, std::uint64_t rip, std::uint64_t now) {
-    const std::uint64_t sub = s->submit.load(std::memory_order_relaxed);
-    if (sub == 0 || now < sub) {
-        return;
-    }
-    writes_to_watched_pages.fetch_add(1, std::memory_order_relaxed);
-    s->last_write.store(now, std::memory_order_relaxed);
-    if (s->write_count.fetch_add(1, std::memory_order_relaxed) == 0) {
-        s->first_write.store(now, std::memory_order_relaxed);
-        s->first_address.store(address, std::memory_order_relaxed);
-        s->first_rip.store(rip, std::memory_order_relaxed);
-#ifndef _WIN32
-        pthread_getname_np(pthread_self(), s->first_thread, sizeof(s->first_thread));
-#else
-        std::strncpy(s->first_thread, "win", sizeof(s->first_thread) - 1);
-#endif
-        clobbered_pages.fetch_add(1, std::memory_order_relaxed);
-        const double ms = TscToMs(now - sub);
-        if (ms < 1.0) {
-            clobbered_under_1ms.fetch_add(1, std::memory_order_relaxed);
-        } else if (ms < 5.0) {
-            clobbered_under_5ms.fetch_add(1, std::memory_order_relaxed);
-        } else if (ms < 20.0) {
-            clobbered_under_20ms.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
+std::size_t RoundUp(std::size_t bytes) {
+    return (bytes + Page - 1) & ~(Page - 1);
 }
 } // namespace
 
-bool Enabled() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("BB_CLOBBER_STATS");
-        return env && env[0] == '1';
-    }();
-    return enabled;
+std::int64_t FirstBadHeader(const std::uint32_t* words, std::uint64_t dwords) {
+    std::uint64_t at = 0;
+    while (at < dwords) {
+        const std::uint32_t header = words[at];
+        switch (header >> 30) {
+        case 3:
+            at += ((header >> 16) & 0x3fff) + 2;
+            break;
+        case 2:
+            ++at;
+            break;
+        default:
+            return std::int64_t(at);
+        }
+    }
+    return -1;
 }
 
-void BeginSubmission() {
-    if (!Enabled()) {
+void NoteSubmit(std::uint64_t seq, const void* guest_dcb, std::uint64_t bytes) {
+    ranges[ranges_head.fetch_add(1, std::memory_order_relaxed) % ranges.size()] =
+        Range{seq, reinterpret_cast<std::uint64_t>(guest_dcb), bytes, NowNs()};
+    static const bool test = [] {
+        const char* env = std::getenv("BB_ISSUE2_TEST");
+        return env && env[0] == '1';
+    }();
+    if (test) {
+        AskForReport();
+    }
+}
+
+void NoteDecoding(std::uint64_t seq) {
+    decoding.store(seq, std::memory_order_relaxed);
+}
+
+void NoteWrite(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, Source source) {
+    if (bytes == 0 || address == 0) {
         return;
     }
-    current_submission_id.fetch_add(1, std::memory_order_relaxed);
-    if ((submissions.fetch_add(1, std::memory_order_relaxed) + 1) % 300 == 0) {
-        report_due.store(1, std::memory_order_relaxed);
+#ifdef _WIN32
+    static thread_local const std::uint32_t tid = 0;
+#else
+    static thread_local const std::uint32_t tid = static_cast<std::uint32_t>(gettid());
+#endif
+    const std::uint64_t now = NowNs();
+    const std::uint64_t decoding_now = decoding.load(std::memory_order_relaxed);
+    writes[writes_head.fetch_add(1, std::memory_order_relaxed) % writes.size()] =
+        Write{address, value, now, decoding_now, bytes, source, tid, 0};
+    // The newest submitted buffer the write lands in.
+    const Range* hit = nullptr;
+    const std::uint64_t head = ranges_head.load(std::memory_order_relaxed);
+    const std::uint64_t count = std::min<std::uint64_t>(head, ranges.size());
+    for (std::uint64_t i = 0; i < count; ++i) {
+        const Range& r = ranges[(head - 1 - i) % ranges.size()];
+        if (r.bytes != 0 && address < r.base + r.bytes && address + bytes > r.base &&
+            (!hit || r.seq > hit->seq)) {
+            hit = &r;
+        }
     }
-    if (report_due.exchange(0, std::memory_order_relaxed) != 0) {
-        ReportNow();
+    if (!hit) {
+        return;
+    }
+    const std::uint64_t n = hits.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > 24 && n % 500 != 0) {
+        return;
+    }
+    const char* where = hit->seq == decoding_now ? "the buffer being decoded"
+                        : hit->seq > decoding_now
+                            ? "a buffer submitted after the one being decoded, not decoded yet"
+                            : "an older buffer, not resubmitted since";
+    const bool late = hit->seq > decoding_now;
+    char thread[32] = "?";
+#ifndef _WIN32
+    pthread_getname_np(pthread_self(), thread, sizeof(thread));
+#endif
+    std::fprintf(stderr,
+                 "Guest write check: %s of %u bytes, value %#llx, to %#llx lands inside submission "
+                 "%llu's command buffer at +%#llx (%s; decoding submission %llu; submitted %.2f ms "
+                 "ago; thread %s; hit %llu)\n",
+                 SourceName(source), bytes, (unsigned long long)value, (unsigned long long)address,
+                 (unsigned long long)hit->seq, (unsigned long long)(address - hit->base), where,
+                 (unsigned long long)decoding_now, (now - hit->ns) / 1e6, thread,
+                 (unsigned long long)n);
+    if (late) {
+        AskForReport();
+    }
+}
+
+void DumpWritesInto(std::uint64_t address, std::uint64_t bytes) {
+    const std::uint64_t now = NowNs();
+    const std::uint64_t head = writes_head.load(std::memory_order_relaxed);
+    const std::uint64_t count = std::min<std::uint64_t>(head, writes.size());
+    unsigned listed = 0;
+    for (std::uint64_t i = 0; i < count && listed < 8; ++i) {
+        const Write& w = writes[(head - 1 - i) % writes.size()];
+        if (w.address < address + bytes && w.address + w.bytes > address) {
+            std::fprintf(stderr,
+                         "  port write into it: %s of %u bytes, value %#llx, to %#llx, %.2f ms ago, "
+                         "while decoding submission %llu (thread %u)\n",
+                         SourceName(w.source), w.bytes, (unsigned long long)w.value,
+                         (unsigned long long)w.address, (now - w.ns) / 1e6,
+                         (unsigned long long)w.decoding, w.tid);
+            ++listed;
+        }
+    }
+    if (listed == 0) {
+        std::fprintf(stderr, "  no remembered port write into it (%llu writes remembered)\n",
+                     (unsigned long long)count);
     }
 }
 
 void AskForReport() {
-    report_due.store(1, std::memory_order_relaxed);
-}
-
-void ReportNow() {
-    std::printf(
-        "Clobber stats: %" PRIu64 " submissions, %" PRIu64 " cmd pages, %" PRIu64
-        " vertex/index pages watched; %" PRIu64 " CPU writes hit a watched page (%" PRIu64
-        " distinct pages: %" PRIu64 " <1ms, %" PRIu64 " 1-5ms, %" PRIu64 " 5-20ms after submit)\n",
-        submissions.load(std::memory_order_relaxed), command_pages.load(std::memory_order_relaxed),
-        vertex_pages.load(std::memory_order_relaxed),
-        writes_to_watched_pages.load(std::memory_order_relaxed),
-        clobbered_pages.load(std::memory_order_relaxed),
-        clobbered_under_1ms.load(std::memory_order_relaxed),
-        clobbered_under_5ms.load(std::memory_order_relaxed),
-        clobbered_under_20ms.load(std::memory_order_relaxed));
-    // Print up to 8 recently clobbered pages with the earliest write delta.
-    int printed = 0;
-    for (const Slot& s : slots) {
-        const std::uint32_t wc = s.write_count.load(std::memory_order_relaxed);
-        const std::uint64_t sub = s.submit.load(std::memory_order_relaxed);
-        const std::uint64_t fw = s.first_write.load(std::memory_order_relaxed);
-        if (wc > 0 && sub > 0 && fw >= sub && TscToMs(fw - sub) < 20.0) {
-            std::printf("  clobbered %s page %#llx (submit #%" PRIu64
-                        "): first write %.2f ms after submit at %#llx from RIP %#llx "
-                        "(thread %s, %u writes)\n",
-                        s.source.load(std::memory_order_relaxed) == 1 ? "cmd" : "vtx",
-                        (unsigned long long)s.page.load(std::memory_order_relaxed),
-                        s.submission_id.load(std::memory_order_relaxed), TscToMs(fw - sub),
-                        (unsigned long long)s.first_address.load(std::memory_order_relaxed),
-                        (unsigned long long)s.first_rip.load(std::memory_order_relaxed),
-                        s.first_thread, wc);
-            if (++printed >= 8) {
-                break;
-            }
-        }
+    static std::atomic<bool> asked{false};
+    if (asked.exchange(true)) {
+        return;
     }
     std::fflush(stdout);
+    std::fprintf(stderr,
+                 "\nSacredFire issue #2: the known \"clobbered dword\" bug just happened (a dword of a "
+                 "submitted command buffer turned into 1); the lines above are its diagnostics.\n"
+                 "SacredFire issue #2: please attach this whole log to "
+                 "https://github.com/T3CHNOLOG1C/SacredFire/issues/2 (launcher: Log page, \"Export "
+                 "log...\") so that the writer can be found and fixed.\n\n");
+    std::fflush(stderr);
 }
 
-void TouchCommandRange(std::uint64_t address, std::uint64_t bytes) {
-    if (Enabled()) {
-        TouchRange(address, bytes, 1);
-    }
-}
-
-void TouchSubmittedRange(std::uint64_t address, std::uint64_t bytes) {
-    if (Enabled()) {
-        TouchRange(address, bytes, 2);
-    }
-}
-
-void TouchCpuWrite(std::uint64_t address, std::uint64_t rip) {
-    if (!Enabled()) {
-        return;
-    }
-    if (Slot* s = Find(address & ~(PageSize - 1))) {
-        RecordWrite(s, address, rip, Rdtsc());
-    }
-}
-
-void TouchCpuWriteRange(std::uint64_t address, std::uint64_t bytes) {
-    if (!Enabled() || address == 0 || bytes == 0) {
-        return;
-    }
-    const std::uint64_t now = Rdtsc();
-    const std::uint64_t first = address & ~(PageSize - 1);
-    const std::uint64_t last = (address + bytes - 1) & ~(PageSize - 1);
-    for (std::uint64_t page = first; page <= last; page += PageSize) {
-        if (Slot* s = Find(page)) {
-            RecordWrite(s, page == first ? address : page, 0, now);
-        }
-    }
-}
-
-namespace {
 bool ProtectCopies() {
+#ifdef _WIN32
+    return false; // SacredFire (Windows): BB_COPY_PROTECT uses mprotect and SIGSEGV (Linux/macOS only)
+#endif
     static const bool enabled = [] {
-        const char* env = std::getenv("BB_PROTECT_CMD_COPIES");
+        const char* env = std::getenv("BB_COPY_PROTECT");
         return env && env[0] == '1';
     }();
     return enabled;
 }
 
-struct Protected {
-    std::atomic<std::uint64_t> base{0};
-    std::atomic<std::uint64_t> bytes{0};
-    std::atomic<std::uint64_t> seq{0};
-};
-constexpr std::size_t MaxProtected = 32;
-std::array<Protected, MaxProtected> protected_copies{};
-std::atomic<std::uint64_t> protected_seq{0};
-} // namespace
-
-const std::uint32_t* MakeProtectedCopy(const std::uint32_t* src, std::uint64_t num_dw) {
+void* AllocCopy(std::size_t bytes) {
+    if (!ProtectCopies()) {
+        return std::malloc(bytes);
+    }
 #ifdef _WIN32
-    (void)src;
-    (void)num_dw;
-    return nullptr;
+    return std::malloc(bytes);
 #else
-    if (!ProtectCopies() || src == nullptr || num_dw == 0) {
-        return nullptr;
+    return std::aligned_alloc(Page, RoundUp(bytes));
+#endif
+}
+
+void FreeCopy(void* storage, std::size_t bytes) {
+#ifndef _WIN32
+    if (ProtectCopies()) {
+        mprotect(storage, RoundUp(bytes), PROT_READ | PROT_WRITE);
+        for (Protected& p : protected_copies) {
+            if (p.base.load(std::memory_order_relaxed) == reinterpret_cast<std::uint64_t>(storage)) {
+                p.base.store(0, std::memory_order_relaxed);
+            }
+        }
     }
-    const std::uint64_t bytes = num_dw * sizeof(std::uint32_t);
-    const std::uint64_t map_bytes = (bytes + PageSize - 1) & ~(PageSize - 1);
-    const std::uint64_t seq = protected_seq.fetch_add(1, std::memory_order_relaxed) + 1;
-    Protected& slot = protected_copies[seq % MaxProtected];
-    const std::uint64_t old_base = slot.base.exchange(0, std::memory_order_acq_rel);
-    const std::uint64_t old_bytes = slot.bytes.exchange(0, std::memory_order_acq_rel);
-    if (old_base != 0 && old_bytes != 0) {
-        munmap(reinterpret_cast<void*>(old_base), (old_bytes + PageSize - 1) & ~(PageSize - 1));
+#endif
+    std::free(storage);
+}
+
+void ProtectCopy(std::uint64_t seq, const void* storage, std::size_t bytes) {
+    if (!ProtectCopies() || bytes == 0) {
+        return;
     }
-    void* mem = mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mem == MAP_FAILED) {
-        return nullptr;
+    for (Protected& p : protected_copies) {
+        std::uint64_t expected = 0;
+        if (p.base.compare_exchange_strong(expected, reinterpret_cast<std::uint64_t>(storage),
+                                           std::memory_order_relaxed)) {
+            p.bytes.store(RoundUp(bytes), std::memory_order_relaxed);
+            p.seq.store(seq, std::memory_order_relaxed);
+            break;
+        }
     }
-    std::memcpy(mem, src, bytes);
-    mprotect(mem, map_bytes, PROT_READ);
-    slot.bytes.store(bytes, std::memory_order_release);
-    slot.seq.store(seq, std::memory_order_release);
-    slot.base.store(reinterpret_cast<std::uint64_t>(mem), std::memory_order_release);
-    return static_cast<const std::uint32_t*>(mem);
+#ifndef _WIN32
+    if (mprotect(const_cast<void*>(storage), RoundUp(bytes), PROT_READ) != 0) {
+        static std::atomic<bool> once{false};
+        if (!once.exchange(true)) {
+            std::perror("BB_COPY_PROTECT: mprotect");
+        }
+    }
 #endif
 }
 

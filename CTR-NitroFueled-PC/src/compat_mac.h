@@ -7,15 +7,56 @@
 #define BB_COMPAT_MAC_H
 #ifdef __APPLE__
 
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
+
+#include <errno.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#ifndef PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP
+#define PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP PTHREAD_RECURSIVE_MUTEX_INITIALIZER
+#endif
+
+#ifndef st_mtim
+#define st_mtim st_mtimespec
+#endif
+
+#ifndef TIMER_ABSTIME
+#define TIMER_ABSTIME 1
+#endif
+
+static inline int compat_clock_nanosleep(clockid_t clk, int flags, const struct timespec *req,
+                                         struct timespec *rem) {
+    if (!req) return EINVAL;
+    if (flags & TIMER_ABSTIME) {
+        struct timespec now;
+        if (clock_gettime(clk, &now) != 0) return EINVAL;
+        int64_t s = (int64_t)req->tv_sec - (int64_t)now.tv_sec;
+        int64_t ns = (int64_t)req->tv_nsec - (int64_t)now.tv_nsec;
+        int64_t wait = s * 1000000000LL + ns;
+        if (wait <= 0) return 0;
+        struct timespec rel = {
+            .tv_sec = (time_t)(wait / 1000000000LL),
+            .tv_nsec = (long)(wait % 1000000000LL),
+        };
+        return nanosleep(&rel, rem) == 0 ? 0 : errno;
+    }
+    return nanosleep(req, rem) == 0 ? 0 : errno;
+}
+#define clock_nanosleep compat_clock_nanosleep
 
 void *compat_low_malloc(size_t size);
 void *compat_low_calloc(size_t count, size_t size);

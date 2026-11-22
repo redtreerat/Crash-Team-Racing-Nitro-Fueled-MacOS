@@ -22,7 +22,6 @@
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <sys/mman.h>
-#include <mach/mach.h>
 #else
 #include <sys/syscall.h>
 #include <sys/mman.h>
