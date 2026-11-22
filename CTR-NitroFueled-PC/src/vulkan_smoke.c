@@ -14,7 +14,11 @@ int vulkan_smoke(void) {
 #ifdef __APPLE__
     if (!getenv("VK_DRIVER_FILES") && !getenv("VK_ICD_FILENAMES")) {
         static const char *const icd_candidates[] = {
+            "out/icd/kosmickrisp_mesa_icd.json",
+            "icd/kosmickrisp_mesa_icd.json",
+            "/usr/local/share/vulkan/icd.d/kosmickrisp_mesa_icd.json",
             "/usr/local/share/vulkan/icd.d/kosmickrisp_mesa_icd.x86_64.json",
+            "/usr/local/etc/vulkan/icd.d/kosmickrisp_mesa_icd.json",
             "/usr/local/etc/vulkan/icd.d/kosmickrisp_mesa_icd.x86_64.json",
             "/usr/local/share/vulkan/icd.d/MoltenVK_icd.json",
             "/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json",

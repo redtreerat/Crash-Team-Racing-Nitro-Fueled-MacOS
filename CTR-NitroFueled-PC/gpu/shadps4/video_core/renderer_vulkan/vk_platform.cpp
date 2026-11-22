@@ -229,9 +229,12 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
 
 std::vector<const char*> GetInstanceLayers(bool enable_validation, bool enable_crash_diagnostic) {
     const auto [properties_result, properties] = vk::enumerateInstanceLayerProperties();
-    if (properties_result != vk::Result::eSuccess || properties.empty()) {
+    if (properties_result != vk::Result::eSuccess) {
         LOG_ERROR(Render_Vulkan, "Failed to query layer properties: {}",
                   vk::to_string(properties_result));
+        return {};
+    }
+    if (properties.empty()) {
         return {};
     }
 
@@ -273,16 +276,21 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         u32 length = PATH_MAX;
         if (_NSGetExecutablePath(path, &length) == 0) {
             const auto dir = std::filesystem::path(path).parent_path();
+            icd_candidates.push_back(dir / "kosmickrisp_mesa_icd.json");
             icd_candidates.push_back(dir / "kosmickrisp_mesa_icd.x86_64.json");
             icd_candidates.push_back(dir / "kosmickrisp_icd.json");
-            icd_candidates.push_back(dir / "MoltenVK_icd.json");
+            icd_candidates.push_back(dir / "icd" / "kosmickrisp_mesa_icd.json");
             icd_candidates.push_back(dir / "icd" / "kosmickrisp_mesa_icd.x86_64.json");
-            icd_candidates.push_back(dir / "icd" / "MoltenVK_icd.json");
+            icd_candidates.push_back(dir / "deps" / "prefix" / "share" / "vulkan" / "icd.d" / "kosmickrisp_mesa_icd.json");
             icd_candidates.push_back(dir / "deps" / "prefix" / "share" / "vulkan" / "icd.d" / "kosmickrisp_mesa_icd.x86_64.json");
+            icd_candidates.push_back(dir / "MoltenVK_icd.json");
+            icd_candidates.push_back(dir / "icd" / "MoltenVK_icd.json");
             icd_candidates.push_back(dir / "deps" / "prefix" / "share" / "vulkan" / "icd.d" / "MoltenVK_icd.json");
             icd_candidates.push_back(dir / "deps" / "prefix" / "etc" / "vulkan" / "icd.d" / "MoltenVK_icd.json");
         }
+        icd_candidates.emplace_back("/usr/local/share/vulkan/icd.d/kosmickrisp_mesa_icd.json");
         icd_candidates.emplace_back("/usr/local/share/vulkan/icd.d/kosmickrisp_mesa_icd.x86_64.json");
+        icd_candidates.emplace_back("/usr/local/etc/vulkan/icd.d/kosmickrisp_mesa_icd.json");
         icd_candidates.emplace_back("/usr/local/etc/vulkan/icd.d/kosmickrisp_mesa_icd.x86_64.json");
         icd_candidates.emplace_back("/usr/local/share/vulkan/icd.d/MoltenVK_icd.json");
         icd_candidates.emplace_back("/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json");

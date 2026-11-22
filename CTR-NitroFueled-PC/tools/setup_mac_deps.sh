@@ -107,7 +107,23 @@ fi
 echo "Running tools/deps.sh..."
 /bin/bash tools/deps.sh
 
-# 6. Check for Vulkan ICDs (KosmicKrisp / MoltenVK)
+# 6. Install x86_64 Mesa KosmicKrisp Vulkan 1.4 driver (required for VK_EXT_robustness2)
+if [[ ! -f "$PWD/out/icd/libvulkan_kosmickrisp.dylib" || ! -f "$PWD/out/icd/kosmickrisp_mesa_icd.json" ]]; then
+    echo "Downloading x86_64 Mesa KosmicKrisp Vulkan 1.4 driver into out/icd/..."
+    mkdir -p "$PWD/out/icd"
+    KK_ZIP="/tmp/shadps4-kosmickrisp-macos.zip"
+    if curl -fSL "https://github.com/shadps4-emu/shadPS4/releases/download/v.0.21.0/shadps4-macos-sdl-0.21.0.zip" -o "$KK_ZIP"; then
+        unzip -o -j "$KK_ZIP" libvulkan_kosmickrisp.dylib kosmickrisp_mesa_icd.json -d "$PWD/out/icd"
+        rm -f "$KK_ZIP"
+        echo "[OK] Installed KosmicKrisp driver into $PWD/out/icd/"
+    else
+        echo "[WARN] Failed to download KosmicKrisp driver; you can install it manually into $PWD/out/icd/."
+    fi
+else
+    echo "[OK] KosmicKrisp driver already installed in $PWD/out/icd/."
+fi
+
+# 7. Check for Vulkan ICDs (KosmicKrisp / MoltenVK)
 echo "Checking Vulkan ICD manifests..."
 ICD_FOUND=0
 for dir in "$PWD/bin" "$PWD/out/icd" /usr/local/share/vulkan/icd.d /opt/homebrew/share/vulkan/icd.d /usr/local/etc/vulkan/icd.d /opt/homebrew/etc/vulkan/icd.d /Library/Vulkan/icd.d "$HOME/.local/share/vulkan/icd.d"; do

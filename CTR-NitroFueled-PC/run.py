@@ -284,10 +284,15 @@ def main():
         env.setdefault('BB_SKIP_CPU_CHECK', '1')
         if not env.get('VK_DRIVER_FILES') and not env.get('VK_ICD_FILENAMES'):
             for icd in (
+                PORT / 'bin' / 'kosmickrisp_mesa_icd.json',
                 PORT / 'bin' / 'kosmickrisp_mesa_icd.x86_64.json',
+                PORT / 'out' / 'icd' / 'kosmickrisp_mesa_icd.json',
                 PORT / 'out' / 'icd' / 'kosmickrisp_mesa_icd.x86_64.json',
+                PORT / 'out' / 'deps' / 'prefix' / 'share' / 'vulkan' / 'icd.d' / 'kosmickrisp_mesa_icd.json',
                 PORT / 'out' / 'deps' / 'prefix' / 'share' / 'vulkan' / 'icd.d' / 'kosmickrisp_mesa_icd.x86_64.json',
+                Path('/usr/local/share/vulkan/icd.d/kosmickrisp_mesa_icd.json'),
                 Path('/usr/local/share/vulkan/icd.d/kosmickrisp_mesa_icd.x86_64.json'),
+                Path('/usr/local/etc/vulkan/icd.d/kosmickrisp_mesa_icd.json'),
                 Path('/usr/local/etc/vulkan/icd.d/kosmickrisp_mesa_icd.x86_64.json'),
                 PORT / 'bin' / 'MoltenVK_icd.json',
                 PORT / 'out' / 'icd' / 'MoltenVK_icd.json',
