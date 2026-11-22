@@ -68,7 +68,7 @@ mkdir -p pgo
 # Submodules (git clone --recursive, or: git submodule update --init) and this port's changes
 # to FSR-Vulkan (gpu/patches/fsr-vulkan), applied to its working tree once.
 if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ]]; then
-    git submodule update --init --recursive
+    git submodule update --init --recursive 2>/dev/null || bash tools/setup_mac_deps.sh
 fi
 # bbport 0.51 (issue 124): a checkout updated from an earlier version keeps that version's patch
 # applied, and the new one applies neither way ("patch does not apply"): the submodule's tree
