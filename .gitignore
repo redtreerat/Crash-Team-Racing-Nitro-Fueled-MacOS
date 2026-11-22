@@ -4,6 +4,7 @@ xcuserdata/
 *.xcscmblueprint
 *.xccheckout
 build/
+dist/
 DerivedData/
 *.moved-aside
 *.pbxuser
@@ -16,6 +17,7 @@ DerivedData/
 !default.perspectivev3
 *.hmap
 *.ipa
+*.dmg
 *.dSYM.zip
 *.dSYM
 

@@ -95,8 +95,13 @@ final class LauncherStore {
     func loadConfigurations() {
         launcherIni.load(from: launcherIniURL)
 
+        let hasBundledEngine = Bundle.main.resourceURL
+            .map { $0.appendingPathComponent("CTR-NitroFueled-PC/out/sacredfire").path }
+            .map { FileManager.default.isExecutableFile(atPath: $0) } ?? false
+
         let savedEngine = launcherIni.string("engine_root")
-        if !savedEngine.isEmpty,
+        if !hasBundledEngine,
+           !savedEngine.isEmpty,
            FileManager.default.fileExists(atPath: URL(fileURLWithPath: savedEngine).appendingPathComponent("run.py").path) {
             engineRootURL = URL(fileURLWithPath: savedEngine)
         }
