@@ -342,36 +342,70 @@ final class LauncherStore {
 
         guard let rawPicked = chooseFolder(title: prompt, startingAt: current) else { return }
         let normalized = Self.resolveGameRoot(rawPicked)
+        clearNotice()
 
         Task {
             let analyzed = await Task.detached(priority: .userInitiated) {
                 Self.analyzeDumpFolder(normalized)
             }.value
 
-            // Auto-route folder based on param.sfo category/version just like upstream launcher!
+            // Always assign to the slot the user clicked AND auto-populate Base/Update when appropriate
             switch analyzed.kind {
             case .complete:
                 gameDirPath = normalized.path
                 gameInfo = analyzed
+                if slot == .base {
+                    baseDirPath = normalized.path
+                    baseInfo = analyzed
+                } else if slot == .update {
+                    updateDirPath = normalized.path
+                    updateInfo = analyzed
+                }
                 saveLauncherIni()
                 if analyzed.isSplitPkgLayout {
+                    postNotice("Selected complete v01.21 dump in Image0/Sc0 PKG layout — flattening automatically…")
                     await mergeFolders(sources: [normalized])
                 } else {
                     await verifyCompleteGameFolder()
+                    if gameCheckPassed {
+                        postNotice("Game folder verified and ready: \(analyzed.regionBadge) v\(analyzed.version) (\(analyzed.formattedSize)).")
+                    } else {
+                        postNotice("Game folder check failed: \(gameCheckMessage)", isError: true)
+                    }
                 }
             case .base:
                 baseDirPath = normalized.path
                 baseInfo = analyzed
+                if slot == .merged {
+                    gameDirPath = normalized.path
+                    gameInfo = analyzed
+                    gameCheckPassed = false
+                    gameCheckMessage = analyzed.statusSummary
+                    postNotice("Selected Base Game v\(analyzed.version) (\(analyzed.regionBadge)). You also need Update 01.21 — select Update 01.21 below to merge them.", isError: true)
+                } else {
+                    postNotice("Selected Base Game: \(analyzed.regionBadge) v\(analyzed.version) (\(analyzed.formattedSize)).")
+                }
                 saveLauncherIni()
             case .update:
                 updateDirPath = normalized.path
                 updateInfo = analyzed
+                if slot == .merged {
+                    gameDirPath = normalized.path
+                    gameInfo = analyzed
+                    gameCheckPassed = false
+                    gameCheckMessage = analyzed.statusSummary
+                    postNotice("Selected Update 01.21 patch folder (\(analyzed.formattedSize)). Select your Base Game folder below to merge them into a complete v01.21 folder.", isError: true)
+                } else {
+                    postNotice("Selected Update 01.21: \(analyzed.regionBadge) (\(analyzed.formattedSize)).")
+                }
                 saveLauncherIni()
             default:
                 switch slot {
                 case .merged:
                     gameDirPath = normalized.path
                     gameInfo = analyzed
+                    gameCheckPassed = false
+                    gameCheckMessage = analyzed.statusSummary
                 case .base:
                     baseDirPath = normalized.path
                     baseInfo = analyzed
@@ -380,6 +414,7 @@ final class LauncherStore {
                     updateInfo = analyzed
                 }
                 saveLauncherIni()
+                postNotice("Invalid game folder '\(normalized.lastPathComponent)': \(analyzed.statusSummary)", isError: true)
             }
         }
     }
@@ -1255,12 +1290,26 @@ final class LauncherStore {
         }
         info.isSplitPkgLayout = layout.isSplit
 
-        // Verify decrypted ELF vs encrypted PS4 FSELF (\x4F\x15\x3D\x1D)
+        // Verify decrypted ELF (\x7FELF) or plaintext PS4 SELF (\x4F\x15\x3D\x1D whose embedded ELF header is present)
         let ebootURL = layout.files.appendingPathComponent("eboot.bin")
         if let fh = try? FileHandle(forReadingFrom: ebootURL) {
-            let magic = (try? fh.read(upToCount: 4)) ?? Data()
+            let headerData = (try? fh.read(upToCount: 4096)) ?? Data()
             try? fh.close()
-            if magic.count == 4 && !(magic[0] == 0x7F && magic[1] == 0x45 && magic[2] == 0x4C && magic[3] == 0x46) {
+            let isPlainElf = headerData.count >= 4
+                && headerData[0] == 0x7F && headerData[1] == 0x45 && headerData[2] == 0x4C && headerData[3] == 0x46
+            var isPlainSelf = false
+            if !isPlainElf && headerData.count >= 32
+                && headerData[0] == 0x4F && headerData[1] == 0x15 && headerData[2] == 0x3D && headerData[3] == 0x1D {
+                let segCount = Int(headerData[24]) | (Int(headerData[25]) << 8)
+                let elfBase = 32 + segCount * 32
+                if elfBase + 4 <= headerData.count {
+                    isPlainSelf = headerData[elfBase] == 0x7F
+                        && headerData[elfBase + 1] == 0x45
+                        && headerData[elfBase + 2] == 0x4C
+                        && headerData[elfBase + 3] == 0x46
+                }
+            }
+            if !isPlainElf && !isPlainSelf {
                 info.kind = .encryptedSelf
                 return info
             }

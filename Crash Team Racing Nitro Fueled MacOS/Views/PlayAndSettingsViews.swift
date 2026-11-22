@@ -150,9 +150,9 @@ struct PlaySectionView: View {
                 title: "CTR v01.21 Dump",
                 detail: store.gameInfo.kind == .complete
                     ? "\(store.activeTitleID) (\(store.gameInfo.formattedSize))"
-                    : "Select Game Folder",
+                    : (store.gameDirPath.isEmpty ? "Select Game Folder" : store.gameInfo.statusSummary),
                 icon: "opticaldisc.fill",
-                isReady: store.gameInfo.kind == .complete && !store.gameInfo.isSplitPkgLayout
+                isReady: store.gameInfo.kind == .complete && !store.gameInfo.isSplitPkgLayout && store.gameCheckPassed
             )
         }
     }
@@ -160,14 +160,40 @@ struct PlaySectionView: View {
     private var gameFolderSection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 14) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Merged Game Folder (CTR v01.21)")
-                            .font(.headline)
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text("Merged Game Folder (CTR v01.21)")
+                                .font(.headline)
+                            if !store.gameDirPath.isEmpty {
+                                let isValid = store.gameInfo.kind == .complete && !store.gameInfo.isSplitPkgLayout && store.gameCheckPassed
+                                Label(
+                                    isValid ? "Ready" : (store.gameInfo.kind == .base || store.gameInfo.kind == .update ? "Merge Required" : "Invalid Folder"),
+                                    systemImage: isValid ? "checkmark.circle.fill" : "xmark.octagon.fill"
+                                )
+                                .font(.caption.weight(.semibold))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 2)
+                                .background((isValid ? Color.green : Color.red).opacity(0.18), in: Capsule())
+                                .foregroundStyle(isValid ? .green : .red)
+                            }
+                        }
+
                         Text(store.gameDirPath.isEmpty ? "Choose your decrypted CUSA13795 or CUSA14876 1.21 dump." : store.gameDirPath)
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
+
+                        if !store.gameDirPath.isEmpty {
+                            let isValid = store.gameInfo.kind == .complete && !store.gameInfo.isSplitPkgLayout && store.gameCheckPassed
+                            HStack(spacing: 6) {
+                                Image(systemName: isValid ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                                Text(store.gameCheckMessage.isEmpty ? store.gameInfo.statusSummary : store.gameCheckMessage)
+                            }
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(isValid ? .green : .red)
+                            .textSelection(.enabled)
+                        }
                     }
                     Spacer()
                     Button("Choose Folder…") {
@@ -200,7 +226,8 @@ struct PlaySectionView: View {
                         folderPickerRow(
                             label: "Base Game (gd)",
                             path: store.baseDirPath,
-                            summary: store.baseInfo.statusSummary
+                            info: store.baseInfo,
+                            expectedKind: .base
                         ) {
                             store.selectGameFolder(slot: .base)
                         }
@@ -208,7 +235,8 @@ struct PlaySectionView: View {
                         folderPickerRow(
                             label: "Update 01.21 (gp)",
                             path: store.updateDirPath,
-                            summary: store.updateInfo.statusSummary
+                            info: store.updateInfo,
+                            expectedKind: .update
                         ) {
                             store.selectGameFolder(slot: .update)
                         }
@@ -249,16 +277,36 @@ struct PlaySectionView: View {
         }
     }
 
-    private func folderPickerRow(label: String, path: String, summary: String, action: @escaping () -> Void) -> some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(label)
-                    .font(.subheadline.weight(.medium))
-                Text(path.isEmpty ? summary : "\(path) — \(summary)")
+    private func folderPickerRow(label: String, path: String, info: GameFolderInfo, expectedKind: DumpKind, action: @escaping () -> Void) -> some View {
+        let isExpected = (info.kind == expectedKind) || (expectedKind == .base && info.kind == .complete)
+        return HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text(label)
+                        .font(.subheadline.weight(.medium))
+                    if !path.isEmpty {
+                        Label(
+                            isExpected ? "Valid" : "Invalid",
+                            systemImage: isExpected ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1.5)
+                        .background((isExpected ? Color.green : Color.red).opacity(0.18), in: Capsule())
+                        .foregroundStyle(isExpected ? .green : .red)
+                    }
+                }
+                if !path.isEmpty {
+                    Text(path)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                Text(info.statusSummary)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .foregroundStyle(path.isEmpty ? Color.secondary : (isExpected ? Color.green : Color.red))
             }
             Spacer()
             Button("Select…", action: action)

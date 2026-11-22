@@ -284,7 +284,7 @@ nonisolated struct GameFolderInfo: Sendable, Equatable {
         case .notGame:
             return "Not recognized (missing eboot.bin or sce_sys/param.sfo)."
         case .encryptedSelf:
-            return "Encrypted PS4 FSELF detected — eboot.bin must be a decrypted ELF dump."
+            return "Encrypted PS4 FSELF detected — eboot.bin must be a decrypted ELF or plaintext PS4 SELF dump."
         case .otherTitle:
             return "Different PS4 title (\(titleID)). Expected CUSA13795 or CUSA14876."
         case .otherVersion:
